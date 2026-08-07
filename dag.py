@@ -7,12 +7,14 @@
   - StateGraph: 管理状态和节点的有向图
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol, TypedDict, runtime_checkable
 import abc
 import json
+import time
 import uuid
 
 
@@ -159,6 +161,105 @@ class SubgraphNode:
                     updates[parent_field] = result[child_field]
             return updates
         return result
+
+
+def parallel(*fns: Callable[[dict], dict | None]) -> Callable[[dict], dict]:
+    """创建一个并行执行节点。
+
+    多个函数并发执行，结果合并后返回。适用于扇出场景。
+
+    Args:
+        fns: 需要并发执行的函数列表，签名 (state) -> dict | None。
+
+    Returns:
+        节点函数，签名 (state: dict) -> dict。
+    """
+    if not fns:
+        raise ValueError("至少需要提供一个函数。")
+
+    def _node(state: dict) -> dict:
+        with ThreadPoolExecutor(max_workers=len(fns)) as executor:
+            futures = [executor.submit(fn, dict(state)) for fn in fns]
+            results: list[dict | None] = []
+            for future in futures:
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    raise RuntimeError(f"并行执行失败: {e}") from e
+
+        merged: dict = {}
+        for r in results:
+            if r is not None:
+                merged.update(r)
+        return merged
+
+    return _node
+
+
+def with_timeout(
+    seconds: float,
+    fn: Callable[[dict], dict | None],
+) -> Callable[[dict], dict | None]:
+    """为节点函数添加超时控制。
+
+    如果函数执行超过指定秒数，抛出 TimeoutError。
+
+    Args:
+        seconds: 超时秒数。
+        fn: 节点函数，签名 (state: dict) -> dict | None。
+
+    Returns:
+        包装后的节点函数。
+    """
+    def _wrapped(state: dict) -> dict | None:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(fn, state)
+            try:
+                return future.result(timeout=seconds)
+            except TimeoutError:
+                raise TimeoutError(
+                    f"节点执行超时（{seconds}秒）"
+                ) from None
+
+    return _wrapped
+
+
+def with_retry(
+    fn: Callable[[dict], dict | None],
+    *,
+    max_retries: int = 3,
+    delay: float = 1.0,
+    backoff: float = 2.0,
+) -> Callable[[dict], dict | None]:
+    """为节点函数添加自动重试。
+
+    函数执行失败时自动重试，支持指数退避。
+
+    Args:
+        fn: 节点函数，签名 (state: dict) -> dict | None。
+        max_retries: 最大重试次数（不包括首次执行），默认 3。
+        delay: 首次重试等待秒数，默认 1.0。
+        backoff: 每次重试延迟倍数，默认 2.0（即 1s, 2s, 4s...）。
+
+    Returns:
+        包装后的节点函数。
+    """
+    def _wrapped(state: dict) -> dict | None:
+        last_exception: Exception | None = None
+        current_delay = delay
+        for attempt in range(max_retries + 1):
+            try:
+                return fn(state)
+            except Exception as e:
+                last_exception = e
+                if attempt < max_retries:
+                    time.sleep(current_delay)
+                    current_delay *= backoff
+        raise RuntimeError(
+            f"节点执行失败（已重试 {max_retries} 次）: {last_exception}"
+        ) from last_exception
+
+    return _wrapped
 
 
 @dataclass
@@ -457,6 +558,7 @@ class CompiledGraph:
         *,
         persistence: "BasePersistence | None" = None,
         thread_id: str | None = None,
+        callback: Callable[[str, dict], None] | None = None,
     ) -> dict:
         """执行图，从入口节点开始，按拓扑顺序执行，到达出口节点后停止。
 
@@ -464,10 +566,55 @@ class CompiledGraph:
             input: 初始状态字典。
             persistence: 可选的持久化存储实例。启用后每步执行后自动保存 checkpoint。
             thread_id: 线程 ID，用于 checkpoint 关联。不传时自动生成。
+            callback: 每步执行后的回调，签名 (node_name, state) -> None。
 
         Returns:
             执行完成后的最终状态字典。
         """
+        for _node_name, _state in self._run_steps(
+            input, persistence=persistence, thread_id=thread_id,
+        ):
+            if callback is not None:
+                callback(_node_name, _state)
+        return _state
+
+    def stream(
+        self,
+        input: dict,
+        *,
+        persistence: "BasePersistence | None" = None,
+        thread_id: str | None = None,
+    ) -> Generator[tuple[str, dict], None, dict]:
+        """流式执行图，逐节点输出 (node_name, state) 状态变化。
+
+        Args:
+            input: 初始状态字典。
+            persistence: 可选的持久化存储实例。
+            thread_id: 线程 ID，用于 checkpoint 关联。
+
+        Yields:
+            (node_name, state) 元组，每次节点执行后输出。
+
+        Returns:
+            执行完成后的最终状态字典。
+        """
+        final_state: dict = None  # type: ignore[assignment]
+        for name, state in self._run_steps(
+            input, persistence=persistence, thread_id=thread_id,
+        ):
+            final_state = state
+            yield name, state
+        assert final_state is not None
+        return final_state
+
+    def _run_steps(
+        self,
+        input: dict,
+        *,
+        persistence: "BasePersistence | None" = None,
+        thread_id: str | None = None,
+    ) -> Generator[tuple[str, dict], None, dict]:
+        """内部生成器：逐步骤执行，产出 (node_name, state) 元组。"""
         state = dict(input)
         current: str | None = self._entry_point
 
@@ -506,7 +653,6 @@ class CompiledGraph:
             try:
                 updates = node.run(state)
             except NodeInterrupt:
-                # 节点调用了 interrupt()，保存 checkpoint 后返回当前状态
                 if persistence_enabled:
                     final_cp = Checkpoint(
                         thread_id=tid,
@@ -520,9 +666,11 @@ class CompiledGraph:
 
             state = _merge_state(state, updates)
 
+            # 产出此步骤的结果
+            yield current, state
+
             # 到达出口节点则停止
             if current == self._finish_point:
-                # 保存最终 checkpoint，标记执行完成
                 if persistence_enabled:
                     cp = Checkpoint(
                         thread_id=tid,
