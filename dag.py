@@ -646,6 +646,7 @@ class CompiledGraph:
                         reason="breakpoint",
                     )
                     persistence.put(tid, final_cp)
+                yield current, state
                 return state
 
             # 执行当前节点
@@ -662,6 +663,7 @@ class CompiledGraph:
                         reason="interrupt",
                     )
                     persistence.put(tid, final_cp)
+                yield current, state
                 return state
 
             state = _merge_state(state, updates)
