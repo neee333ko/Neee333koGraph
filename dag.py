@@ -21,6 +21,29 @@ class CompileError(ValueError):
     pass
 
 
+class NodeInterrupt(Exception):
+    """节点执行中断信号。
+
+    节点函数中调用 interrupt() 时抛出，由 CompiledGraph 捕获后暂停执行。
+    """
+    pass
+
+
+def interrupt() -> None:
+    """在节点函数中调用，暂停执行等待人工介入。
+
+    执行引擎会保存当前 checkpoint 并返回部分状态。
+    调用 resume() 并传入 Command 后继续执行。
+
+    用法:
+        def my_node(state: dict) -> dict:
+            result = do_something(state)
+            interrupt()  # 暂停，等待人工审批
+            return result
+    """
+    raise NodeInterrupt()
+
+
 class State(TypedDict):
     """状态基类，用户通过继承定义结构化字段。
 
@@ -330,6 +353,25 @@ class CompiledGraph:
         for ce in conditional_edges:
             self._conditional_map[ce.source] = ce
 
+        # 运行时动态断点（非侵入式，无需修改节点代码）
+        self._breakpoints: set[str] = set()
+
+    def set_breakpoint(self, node_name: str) -> None:
+        """设置运行时断点。执行到指定节点时自动暂停。
+
+        Args:
+            node_name: 要设置断点的节点名称。
+        """
+        self._breakpoints.add(node_name)
+
+    def remove_breakpoint(self, node_name: str) -> None:
+        """移除指定节点的运行时断点。
+
+        Args:
+            node_name: 要移除断点的节点名称。
+        """
+        self._breakpoints.discard(node_name)
+
     def invoke(
         self,
         input: dict,
@@ -367,9 +409,36 @@ class CompiledGraph:
                 )
                 persistence.put(tid, cp)
 
+            # 检查运行时断点
+            if current in self._breakpoints:
+                if persistence_enabled:
+                    final_cp = Checkpoint(
+                        thread_id=tid,
+                        step=step,
+                        state=state,
+                        next_node=current,
+                        reason="breakpoint",
+                    )
+                    persistence.put(tid, final_cp)
+                return state
+
             # 执行当前节点
             node = self._nodes[current]
-            updates = node.run(state)
+            try:
+                updates = node.run(state)
+            except NodeInterrupt:
+                # 节点调用了 interrupt()，保存 checkpoint 后返回当前状态
+                if persistence_enabled:
+                    final_cp = Checkpoint(
+                        thread_id=tid,
+                        step=step,
+                        state=state,
+                        next_node=current,
+                        reason="interrupt",
+                    )
+                    persistence.put(tid, final_cp)
+                return state
+
             state = _merge_state(state, updates)
 
             # 到达出口节点则停止
@@ -381,6 +450,7 @@ class CompiledGraph:
                         step=step,
                         state=state,
                         next_node=None,
+                        reason="checkpoint",
                     )
                     persistence.put(tid, cp)
                 break
@@ -414,6 +484,8 @@ class CompiledGraph:
         self,
         thread_id: str,
         persistence: "BasePersistence",
+        *,
+        command: "Command | None" = None,
     ) -> dict:
         """从指定线程的 checkpoint 恢复执行。
 
@@ -422,6 +494,7 @@ class CompiledGraph:
         Args:
             thread_id: 线程 ID。
             persistence: 持久化存储实例。
+            command: 可选的人类指令，可更新状态、重定向节点或终止执行。
 
         Returns:
             执行完成后的最终状态字典。
@@ -439,6 +512,22 @@ class CompiledGraph:
         # 如果 next_node 为 None，说明已经执行完成
         if current is None:
             return state
+
+        # 应用人类指令
+        if command is not None:
+            if command.update is not None:
+                state = _merge_state(state, command.update)
+            if command.goto is not None:
+                current = command.goto
+            elif cp.reason == "interrupt":
+                # 中断恢复：跳过已中断的节点，找下一个
+                current = self._get_next_node(current, state)
+            # 断点/崩溃恢复：重新执行当前节点（current 保持不变）
+            if not command.resume:
+                return state
+        elif current is not None:
+            # 没有 command，正常恢复：跳过已执行过的 checkpoint 节点
+            pass
 
         step = cp.step
 
@@ -484,11 +573,27 @@ class Checkpoint:
         step: 步骤编号，从 1 开始递增。
         state: 当前状态快照。
         next_node: 下一步待执行的节点名称。None 表示执行已完成。
+        reason: 暂停原因。"checkpoint"（正常保存）、"interrupt"（中断）、"breakpoint"（断点）。
     """
     thread_id: str
     step: int
     state: dict
     next_node: str | None
+    reason: str = "checkpoint"
+
+
+@dataclass
+class Command:
+    """人类指令，用于恢复执行时提供输入。
+
+    Attributes:
+        update: 可选的状态更新，恢复前合并到当前状态。
+        goto: 可选的重定向到指定节点。不传则按原路径继续。
+        resume: 是否继续执行。设为 False 则终止执行。
+    """
+    update: dict | None = None
+    goto: str | None = None
+    resume: bool = True
 
 
 class BasePersistence(abc.ABC):
@@ -523,6 +628,7 @@ class FilePersistence(BasePersistence):
             "step": checkpoint.step,
             "state": checkpoint.state,
             "next_node": checkpoint.next_node,
+            "reason": checkpoint.reason,
         }
         with open(file_path, "w") as f:
             json.dump(data, f)
@@ -538,4 +644,5 @@ class FilePersistence(BasePersistence):
             step=data["step"],
             state=data["state"],
             next_node=data["next_node"],
+            reason=data.get("reason", "checkpoint"),
         )
