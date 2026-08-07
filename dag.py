@@ -10,10 +10,17 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypedDict
+from typing import Protocol, TypedDict, runtime_checkable
 import abc
 import json
 import uuid
+
+
+@runtime_checkable
+class _NodeProtocol(Protocol):
+    """节点协议：任何具有 run 方法的对象都可用作节点。"""
+    name: str
+    def run(self, state: dict) -> dict | None: ...
 
 
 class CompileError(ValueError):
@@ -99,6 +106,59 @@ class Node:
             节点返回的局部更新，或 None。
         """
         return self.fn(state)
+
+
+class SubgraphNode:
+    """子图节点，包装一个编译后的子图。
+
+    执行时从父状态提取子状态 → 执行子图 → 合并回父状态。
+
+    Args:
+        name: 节点名称。
+        subgraph: 编译后的子图。
+        state_mapping: 可选的状态字段映射 {父字段: 子字段}。
+                      不传则整个父状态传入子图，子图结果全部合并回父状态。
+    """
+
+    def __init__(
+        self,
+        name: str,
+        subgraph: "CompiledGraph",
+        state_mapping: dict[str, str] | None = None,
+    ) -> None:
+        self.name = name
+        self.subgraph = subgraph
+        self.state_mapping = state_mapping
+
+    def run(self, state: dict) -> dict | None:
+        """执行子图。
+
+        Args:
+            state: 父状态。
+
+        Returns:
+            子图执行后的状态更新。
+        """
+        if self.state_mapping:
+            # 选择性映射：只提取映射的字段
+            child_state = {}
+            for parent_field, child_field in self.state_mapping.items():
+                if parent_field in state:
+                    child_state[child_field] = state[parent_field]
+        else:
+            # 完整映射：整个父状态传入子图
+            child_state = dict(state)
+
+        result = self.subgraph.invoke(child_state)
+
+        if self.state_mapping:
+            # 反向映射：子图结果写回父状态字段
+            updates = {}
+            for parent_field, child_field in self.state_mapping.items():
+                if child_field in result:
+                    updates[parent_field] = result[child_field]
+            return updates
+        return result
 
 
 @dataclass
@@ -195,7 +255,7 @@ class StateGraph:
 
     def __init__(self, state_class: type[State]) -> None:
         self._state_class = state_class
-        self._nodes: dict[str, Node] = {}
+        self._nodes: dict[str, _NodeProtocol] = {}
         self._edges: list[Edge] = []
         self._conditional_edges: list[ConditionalEdge] = []
         self._entry_point: str | None = None
@@ -209,6 +269,25 @@ class StateGraph:
             fn: 可调用对象，签名 (state: dict) -> dict | None。
         """
         self._nodes[name] = Node(name=name, fn=fn)
+
+    def add_subgraph(
+        self,
+        name: str,
+        subgraph: "CompiledGraph",
+        state_mapping: dict[str, str] | None = None,
+    ) -> None:
+        """注册一个子图节点。
+
+        Args:
+            name: 节点名称，在图中唯一标识。
+            subgraph: 编译后的子图。
+            state_mapping: 可选的状态字段映射 {父字段: 子字段}。
+        """
+        self._nodes[name] = SubgraphNode(
+            name=name,
+            subgraph=subgraph,
+            state_mapping=state_mapping,
+        )
 
     def add_edge(self, source: str, target: str) -> None:
         """添加一条普通边：从 source 节点无条件指向 target 节点。
@@ -328,7 +407,7 @@ class CompiledGraph:
     def __init__(
         self,
         state_class: type[State],
-        nodes: dict[str, Node],
+        nodes: dict[str, _NodeProtocol],
         edges: list[Edge],
         conditional_edges: list[ConditionalEdge],
         entry_point: str,
