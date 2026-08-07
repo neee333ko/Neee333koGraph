@@ -1,0 +1,5 @@
+.venv/
+.trae/
+__pycache__/
+.checkpoints/
+*.pyc
