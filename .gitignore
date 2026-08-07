@@ -2,4 +2,5 @@
 .trae/
 __pycache__/
 .checkpoints/
+.demo_checkpoints/
 *.pyc

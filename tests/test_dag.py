@@ -324,5 +324,72 @@ class TestInvoke(unittest.TestCase):
         self.assertEqual(result["name"], "test")
 
 
+class TestAsyncInvoke(unittest.IsolatedAsyncioTestCase):
+    """测试异步执行。"""
+
+    def setUp(self):
+        class S(State):
+            count: int
+        self.S = S
+
+    async def test_ainvoke_linear_chain(self):
+        """验证异步线性链执行。"""
+        async def a_inc(state: dict) -> dict:
+            return {"count": state["count"] + 1}
+
+        g = StateGraph(self.S)
+        g.add_node("a", a_inc)
+        g.add_node("b", lambda s: {"count": s["count"] * 2})
+        g.add_node("end", lambda s: None)
+        g.add_edge("a", "b")
+        g.add_edge("b", "end")
+        g.set_entry_point("a")
+        g.set_finish_point("end")
+        app = g.compile()
+        result = await app.ainvoke({"count": 1})
+        self.assertEqual(result["count"], 4)  # (1+1)*2 = 4
+
+    async def test_ainvoke_mixed_sync_async(self):
+        """验证同步和异步节点混合执行。"""
+        async def a_inc(state: dict) -> dict:
+            return {"count": state["count"] + 1}
+
+        g = StateGraph(self.S)
+        g.add_node("a", a_inc)  # async
+        g.add_node("b", lambda s: {"count": s["count"] * 2})  # sync
+        g.add_node("end", lambda s: None)
+        g.add_edge("a", "b")
+        g.add_edge("b", "end")
+        g.set_entry_point("a")
+        g.set_finish_point("end")
+        app = g.compile()
+        result = await app.ainvoke({"count": 1})
+        self.assertEqual(result["count"], 4)
+
+    async def test_astream(self):
+        """验证异步流式输出。"""
+        async def a_inc(state: dict) -> dict:
+            return {"count": state["count"] + 1}
+
+        g = StateGraph(self.S)
+        g.add_node("a", a_inc)
+        g.add_node("b", lambda s: {"count": s["count"] * 2})
+        g.add_node("end", lambda s: None)
+        g.add_edge("a", "b")
+        g.add_edge("b", "end")
+        g.set_entry_point("a")
+        g.set_finish_point("end")
+        app = g.compile()
+
+        steps = []
+        final_state = None
+        async for name, state in app.astream({"count": 1}):
+            steps.append((name, state["count"]))
+            final_state = state["count"]
+
+        self.assertEqual(steps, [("a", 2), ("b", 4), ("end", 4)])
+        self.assertEqual(final_state, 4)
+
+
 if __name__ == "__main__":
     unittest.main()

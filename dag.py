@@ -7,12 +7,13 @@
   - StateGraph: 管理状态和节点的有向图
 """
 
-from collections.abc import Callable, Generator
+from collections.abc import AsyncGenerator, Callable, Generator
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, TypedDict, runtime_checkable
+from typing import Any, Protocol, TypedDict, runtime_checkable
 import abc
+import inspect
 import json
 import time
 import uuid
@@ -22,7 +23,7 @@ import uuid
 class _NodeProtocol(Protocol):
     """节点协议：任何具有 run 方法的对象都可用作节点。"""
     name: str
-    def run(self, state: dict) -> dict | None: ...
+    def run(self, state: dict) -> Any: ...
 
 
 class CompileError(ValueError):
@@ -88,18 +89,21 @@ class Node:
     """图中的节点，封装一个可调用函数。
 
     节点接收当前状态，返回局部更新（dict 或 None）。
+    支持同步和 async 函数。
 
     Args:
         name: 节点名称，在图中唯一标识。
         fn: 可调用对象，签名 (state: dict) -> dict | None。
     """
 
-    def __init__(self, name: str, fn: Callable[[dict], dict | None]) -> None:
+    def __init__(self, name: str, fn: Callable[..., Any]) -> None:
         self.name = name
         self.fn = fn
 
-    def run(self, state: dict) -> dict | None:
+    def run(self, state: dict) -> Any:
         """执行节点函数。
+
+        如果是 async 函数，返回 coroutine 需要 await。
 
         Args:
             state: 当前完整状态。
@@ -362,12 +366,13 @@ class StateGraph:
         self._entry_point: str | None = None
         self._finish_point: str | None = None
 
-    def add_node(self, name: str, fn: Callable[[dict], dict | None]) -> None:
+    def add_node(self, name: str, fn: Callable[..., Any]) -> None:
         """注册一个节点。
 
         Args:
             name: 节点名称，在图中唯一标识。
             fn: 可调用对象，签名 (state: dict) -> dict | None。
+                支持同步和 async 函数。
         """
         self._nodes[name] = Node(name=name, fn=fn)
 
@@ -774,6 +779,235 @@ class CompiledGraph:
             # 执行当前节点
             node = self._nodes[current]
             updates = node.run(state)
+            state = _merge_state(state, updates)
+
+            # 到达出口节点则停止
+            if current == self._finish_point:
+                cp = Checkpoint(
+                    thread_id=thread_id,
+                    step=step,
+                    state=state,
+                    next_node=None,
+                )
+                persistence.put(thread_id, cp)
+                break
+
+            # 查找下一个节点
+            current = self._get_next_node(current, state)
+
+        return state
+
+    async def ainvoke(
+        self,
+        input: dict,
+        *,
+        persistence: "BasePersistence | None" = None,
+        thread_id: str | None = None,
+        callback: Callable[[str, dict], None] | None = None,
+    ) -> dict:
+        """异步执行图，从入口节点开始，按拓扑顺序执行，到达出口节点后停止。
+
+        Args:
+            input: 初始状态字典。
+            persistence: 可选的持久化存储实例。启用后每步执行后自动保存 checkpoint。
+            thread_id: 线程 ID，用于 checkpoint 关联。不传时自动生成。
+            callback: 每步执行后的回调，签名 (node_name, state) -> None。
+
+        Returns:
+            执行完成后的最终状态字典。
+        """
+        async for _node_name, _state in self._arun_steps(
+            input, persistence=persistence, thread_id=thread_id,
+        ):
+            if callback is not None:
+                callback(_node_name, _state)
+        return _state
+
+    async def astream(
+        self,
+        input: dict,
+        *,
+        persistence: "BasePersistence | None" = None,
+        thread_id: str | None = None,
+    ) -> AsyncGenerator[tuple[str, dict], None]:
+        """异步流式执行图，逐节点输出 (node_name, state) 状态变化。
+
+        Args:
+            input: 初始状态字典。
+            persistence: 可选的持久化存储实例。
+            thread_id: 线程 ID，用于 checkpoint 关联。
+
+        Yields:
+            (node_name, state) 元组，每次节点执行后输出。
+
+        Note:
+            最终状态可通过返回值获得（在 Python >= 3.12 中通过 `agen.athrow()` 获取）。
+        """
+        final_state: dict = None  # type: ignore[assignment]
+        async for name, state in self._arun_steps(
+            input, persistence=persistence, thread_id=thread_id,
+        ):
+            final_state = state
+            yield name, state
+        assert final_state is not None
+        # async generator cannot return a value, but we don't need it anyway
+        return
+
+    async def _arun_steps(
+        self,
+        input: dict,
+        *,
+        persistence: "BasePersistence | None" = None,
+        thread_id: str | None = None,
+    ) -> AsyncGenerator[tuple[str, dict], None]:
+        """内部异步生成器：逐步骤执行，产出 (node_name, state) 元组。"""
+        state = dict(input)
+        current: str | None = self._entry_point
+
+        persistence_enabled = persistence is not None
+        if persistence_enabled:
+            tid = thread_id or uuid.uuid4().hex
+            step = 0
+
+        while current is not None:
+            # 保存 checkpoint（在执行节点前保存，崩溃后可恢复到此节点）
+            if persistence_enabled:
+                step += 1
+                cp = Checkpoint(
+                    thread_id=tid,
+                    step=step,
+                    state=state,
+                    next_node=current,
+                )
+                persistence.put(tid, cp)
+
+            # 检查运行时断点
+            if current in self._breakpoints:
+                if persistence_enabled:
+                    final_cp = Checkpoint(
+                        thread_id=tid,
+                        step=step,
+                        state=state,
+                        next_node=current,
+                        reason="breakpoint",
+                    )
+                    persistence.put(tid, final_cp)
+                yield current, state
+                return
+
+            # 执行当前节点
+            node = self._nodes[current]
+            try:
+                result = node.run(state)
+                if inspect.iscoroutine(result):
+                    updates = await result
+                else:
+                    updates = result
+            except NodeInterrupt:
+                if persistence_enabled:
+                    final_cp = Checkpoint(
+                        thread_id=tid,
+                        step=step,
+                        state=state,
+                        next_node=current,
+                        reason="interrupt",
+                    )
+                    persistence.put(tid, final_cp)
+                yield current, state
+                return
+
+            state = _merge_state(state, updates)
+
+            # 产出此步骤的结果
+            yield current, state
+
+            # 到达出口节点则停止
+            if current == self._finish_point:
+                if persistence_enabled:
+                    cp = Checkpoint(
+                        thread_id=tid,
+                        step=step,
+                        state=state,
+                        next_node=None,
+                        reason="checkpoint",
+                    )
+                    persistence.put(tid, cp)
+                break
+
+            # 查找下一个节点
+            current = self._get_next_node(current, state)
+
+        return
+
+    async def aresume(
+        self,
+        thread_id: str,
+        persistence: "BasePersistence",
+        *,
+        command: "Command | None" = None,
+    ) -> dict:
+        """异步从指定线程的 checkpoint 恢复执行。
+
+        加载最近一次 checkpoint，从中断处继续执行。
+
+        Args:
+            thread_id: 线程 ID。
+            persistence: 持久化存储实例。
+            command: 可选的人类指令，可更新状态、重定向节点或终止执行。
+
+        Returns:
+            执行完成后的最终状态字典。
+
+        Raises:
+            ValueError: 指定线程的 checkpoint 不存在时抛出。
+        """
+        cp = persistence.get(thread_id)
+        if cp is None:
+            raise ValueError(f"线程 '{thread_id}' 的 checkpoint 不存在。")
+
+        state = dict(cp.state)
+        current: str | None = cp.next_node
+
+        # 如果 next_node 为 None，说明已经执行完成
+        if current is None:
+            return state
+
+        # 应用人类指令
+        if command is not None:
+            if command.update is not None:
+                state = _merge_state(state, command.update)
+            if command.goto is not None:
+                current = command.goto
+            elif cp.reason == "interrupt":
+                # 中断恢复：跳过已中断的节点，找下一个
+                current = self._get_next_node(current, state)
+            # 断点/崩溃恢复：重新执行当前节点（current 保持不变）
+            if not command.resume:
+                return state
+        elif current is not None:
+            # 没有 command，正常恢复：跳过已执行过的 checkpoint 节点
+            pass
+
+        step = cp.step
+
+        while current is not None:
+            # 保存 checkpoint（在执行节点前保存）
+            step += 1
+            cp = Checkpoint(
+                thread_id=thread_id,
+                step=step,
+                state=state,
+                next_node=current,
+            )
+            persistence.put(thread_id, cp)
+
+            # 执行当前节点
+            node = self._nodes[current]
+            result = node.run(state)
+            if inspect.iscoroutine(result):
+                updates = await result
+            else:
+                updates = result
             state = _merge_state(state, updates)
 
             # 到达出口节点则停止
