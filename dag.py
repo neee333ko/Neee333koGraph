@@ -9,9 +9,18 @@
 
 from collections.abc import AsyncGenerator, Callable, Generator
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, TypedDict, runtime_checkable
+from typing import (
+    Annotated,
+    Any,
+    Protocol,
+    TypedDict,
+    get_args,
+    get_origin,
+    get_type_hints,
+    runtime_checkable,
+)
 import abc
 import inspect
 import json
@@ -28,6 +37,11 @@ class _NodeProtocol(Protocol):
 
 class CompileError(ValueError):
     """图编译失败时抛出的异常。"""
+    pass
+
+
+class GraphRecursionError(RuntimeError):
+    """图执行超过最大允许节点步数时抛出的异常。"""
     pass
 
 
@@ -65,15 +79,72 @@ class State(TypedDict):
     pass
 
 
-def _merge_state(current: dict, updates: dict | None) -> dict:
+@dataclass
+class RunConfig:
+    """单次图执行的运行配置。
+
+    Attributes:
+        thread_id: 执行线程 ID，用于关联 checkpoint。
+        recursion_limit: 单次执行允许的最大节点步数。
+        max_concurrency: 动态并行任务的最大并发数。
+        metadata: 运行级可观测元数据。
+        context: 不写入 State 的运行时上下文。
+    """
+
+    thread_id: str | None = None
+    recursion_limit: int = 100
+    max_concurrency: int = 8
+    metadata: dict[str, Any] = field(default_factory=dict)
+    context: dict[str, Any] = field(default_factory=dict)
+
+
+def _resolve_run_config(
+    config: RunConfig | None,
+    thread_id: str | None = None,
+) -> RunConfig:
+    """解析并校验单次执行使用的运行配置。
+
+    Args:
+        config: 可选的运行配置。
+        thread_id: 兼容旧 API 的线程 ID；传入时优先于 config.thread_id。
+
+    Returns:
+        与调用方配置隔离的 RunConfig 实例。
+
+    Raises:
+        ValueError: recursion_limit 或 max_concurrency 小于 1 时抛出。
+    """
+    source = config or RunConfig()
+    if source.recursion_limit < 1:
+        raise ValueError("recursion_limit 必须大于等于 1。")
+    if source.max_concurrency < 1:
+        raise ValueError("max_concurrency 必须大于等于 1。")
+    return RunConfig(
+        thread_id=thread_id if thread_id is not None else source.thread_id,
+        recursion_limit=source.recursion_limit,
+        max_concurrency=source.max_concurrency,
+        metadata=dict(source.metadata),
+        context=dict(source.context),
+    )
+
+
+def _merge_state(
+    current: dict,
+    updates: dict | None,
+    reducers: dict[str, Callable[[Any, Any], Any]] | None = None,
+) -> dict:
     """将节点返回的局部更新合并到当前状态。
 
-    合并策略：updates 中的字段直接覆盖 current 中同名字段（浅合并）。
+    合并策略：
+      - 默认行为：updates 中的字段直接覆盖 current 中同名字段（浅合并）。
+      - 归约器：如果某字段在 reducers 中有注册，则调用归约器 (current_value, update_value) 计算新值。
     当 updates 为 None 时，保持当前状态不变。
 
     Args:
         current: 当前完整状态。
         updates: 节点返回的局部更新，或 None。
+        reducers: 可选的自定义归约器字典 {字段名: 归约函数}。
+                  归约函数签名 (current_value, update_value) -> new_value。
 
     Returns:
         合并后的新状态字典。
@@ -81,8 +152,39 @@ def _merge_state(current: dict, updates: dict | None) -> dict:
     if updates is None:
         return current
     merged = dict(current)
-    merged.update(updates)
+    for key, value in updates.items():
+        if reducers and key in reducers:
+            merged[key] = reducers[key](merged.get(key), value)
+        else:
+            merged[key] = value
     return merged
+
+
+def _parse_reducers(state_class: type) -> dict[str, Callable[[Any, Any], Any]]:
+    """从 State 类的 Annotated 类型注解中提取归约器。
+
+    用法:
+        class MyState(State):
+            messages: Annotated[list[str], operator.add]
+
+    解析后返回 {"messages": operator.add}。
+
+    Args:
+        state_class: 继承自 State 的 TypedDict 子类。
+
+    Returns:
+        {字段名: 归约函数} 字典，没有归约器则返回空字典。
+    """
+    reducers: dict[str, Callable[[Any, Any], Any]] = {}
+    type_hints = get_type_hints(state_class, include_extras=True)
+    for field_name, field_type in type_hints.items():
+        if get_origin(field_type) is not Annotated:
+            continue
+        for metadata in get_args(field_type)[1:]:
+            if callable(metadata):
+                reducers[field_name] = metadata
+                break
+    return reducers
 
 
 class Node:
@@ -365,6 +467,7 @@ class StateGraph:
         self._conditional_edges: list[ConditionalEdge] = []
         self._entry_point: str | None = None
         self._finish_point: str | None = None
+        self._reducers: dict[str, Callable[[Any, Any], Any]] = _parse_reducers(state_class)
 
     def add_node(self, name: str, fn: Callable[..., Any]) -> None:
         """注册一个节点。
@@ -501,6 +604,7 @@ class StateGraph:
             entry_point=self._entry_point,
             finish_point=self._finish_point,
             execution_order=execution_order,
+            reducers=self._reducers,
         )
 
 
@@ -519,6 +623,7 @@ class CompiledGraph:
         entry_point: str,
         finish_point: str,
         execution_order: list[str],
+        reducers: dict[str, Callable[[Any, Any], Any]] | None = None,
     ) -> None:
         self._state_class = state_class
         self._nodes = nodes
@@ -540,6 +645,9 @@ class CompiledGraph:
 
         # 运行时动态断点（非侵入式，无需修改节点代码）
         self._breakpoints: set[str] = set()
+
+        # 自定义归约器
+        self._reducers: dict[str, Callable[[Any, Any], Any]] = reducers or {}
 
     def set_breakpoint(self, node_name: str) -> None:
         """设置运行时断点。执行到指定节点时自动暂停。
@@ -671,7 +779,7 @@ class CompiledGraph:
                 yield current, state
                 return state
 
-            state = _merge_state(state, updates)
+            state = _merge_state(state, updates, self._reducers)
 
             # 产出此步骤的结果
             yield current, state
@@ -750,7 +858,7 @@ class CompiledGraph:
         # 应用人类指令
         if command is not None:
             if command.update is not None:
-                state = _merge_state(state, command.update)
+                state = _merge_state(state, command.update, self._reducers)
             if command.goto is not None:
                 current = command.goto
             elif cp.reason == "interrupt":
@@ -779,7 +887,7 @@ class CompiledGraph:
             # 执行当前节点
             node = self._nodes[current]
             updates = node.run(state)
-            state = _merge_state(state, updates)
+            state = _merge_state(state, updates, self._reducers)
 
             # 到达出口节点则停止
             if current == self._finish_point:
@@ -916,7 +1024,7 @@ class CompiledGraph:
                 yield current, state
                 return
 
-            state = _merge_state(state, updates)
+            state = _merge_state(state, updates, self._reducers)
 
             # 产出此步骤的结果
             yield current, state
@@ -975,7 +1083,7 @@ class CompiledGraph:
         # 应用人类指令
         if command is not None:
             if command.update is not None:
-                state = _merge_state(state, command.update)
+                state = _merge_state(state, command.update, self._reducers)
             if command.goto is not None:
                 current = command.goto
             elif cp.reason == "interrupt":
@@ -1008,7 +1116,7 @@ class CompiledGraph:
                 updates = await result
             else:
                 updates = result
-            state = _merge_state(state, updates)
+            state = _merge_state(state, updates, self._reducers)
 
             # 到达出口节点则停止
             if current == self._finish_point:

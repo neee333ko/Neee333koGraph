@@ -1,10 +1,11 @@
 """轻量 DAG 框架单元测试。"""
 
+import asyncio
 import unittest
 from dag import (
     State, Node, Edge, ConditionalEdge,
     StateGraph, CompiledGraph, CompileError,
-    _merge_state,
+    _merge_state, _parse_reducers,
 )
 
 
@@ -389,6 +390,118 @@ class TestAsyncInvoke(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(steps, [("a", 2), ("b", 4), ("end", 4)])
         self.assertEqual(final_state, 4)
+
+
+class TestStateReducer(unittest.TestCase):
+    """测试自定义状态归约器。"""
+
+    def test_merge_with_reducer(self):
+        """验证 _merge_state 使用归约器合并字段。"""
+        def add_reducer(a: int, b: int) -> int:
+            return a + b
+
+        reducers = {"count": add_reducer}
+        result = _merge_state({"count": 1}, {"count": 2}, reducers)
+        self.assertEqual(result["count"], 3)
+
+    def test_merge_without_reducer(self):
+        """验证无归约器时仍使用覆盖策略。"""
+        result = _merge_state({"count": 1}, {"count": 2}, {"other": lambda a, b: a})
+        self.assertEqual(result["count"], 2)
+
+    def test_merge_reducer_new_field(self):
+        """验证归约器处理当前不存在的字段。"""
+        def add_reducer(a: int | None, b: int) -> int:
+            return (a or 0) + b
+
+        reducers = {"count": add_reducer}
+        result = _merge_state({}, {"count": 5}, reducers)
+        self.assertEqual(result["count"], 5)
+
+    def test_parse_reducers(self):
+        """验证从 Annotated 类型提取归约器。"""
+        import operator
+        from typing import Annotated
+
+        class MyState(State):
+            messages: Annotated[list[str], operator.add]
+            count: int
+
+        reducers = _parse_reducers(MyState)
+        self.assertIn("messages", reducers)
+        self.assertIs(reducers["messages"], operator.add)
+        self.assertNotIn("count", reducers)
+
+    def test_parse_reducers_inherited_metadata(self):
+        """验证继承字段和多个 Annotated 元数据可正确解析。"""
+        import operator
+        from typing import Annotated
+
+        class BaseState(State):
+            messages: Annotated[list[str], "追加消息", operator.add]
+
+        class ChildState(BaseState):
+            count: int
+
+        reducers = _parse_reducers(ChildState)
+        self.assertEqual(reducers, {"messages": operator.add})
+
+    def test_parse_reducers_no_annotated(self):
+        """验证无 Annotated 字段时返回空字典。"""
+        class PlainState(State):
+            name: str
+            age: int
+
+        reducers = _parse_reducers(PlainState)
+        self.assertEqual(reducers, {})
+
+    def test_reducer_invoke(self):
+        """验证归约器在 invoke 执行中生效。"""
+        import operator
+        from typing import Annotated
+
+        class ListState(State):
+            messages: Annotated[list[str], operator.add]
+            count: int
+
+        g = StateGraph(ListState)
+        g.add_node("a", lambda s: {"messages": ["hello"]})
+        g.add_node("b", lambda s: {"messages": ["world"]})
+        g.add_node("end", lambda s: None)
+        g.add_edge("a", "b")
+        g.add_edge("b", "end")
+        g.set_entry_point("a")
+        g.set_finish_point("end")
+        app = g.compile()
+        result = app.invoke({"messages": ["start"], "count": 0})
+        self.assertEqual(result["messages"], ["start", "hello", "world"])
+
+    def test_reducer_async_invoke(self):
+        """验证归约器在异步执行中生效。"""
+        import operator
+        from typing import Annotated
+
+        class ListState(State):
+            messages: Annotated[list[str], operator.add]
+            count: int
+
+        g = StateGraph(ListState)
+
+        async def add_hello(state: dict) -> dict:
+            return {"messages": ["hello"]}
+
+        g.add_node("a", add_hello)
+        g.add_node("end", lambda s: None)
+        g.add_edge("a", "end")
+        g.set_entry_point("a")
+        g.set_finish_point("end")
+        app = g.compile()
+
+        async def run():
+            return await app.ainvoke({"messages": ["start"], "count": 0})
+
+        result = asyncio.run(run())
+        self.assertEqual(result["messages"], ["start", "hello"])
 
 
 if __name__ == "__main__":
