@@ -380,6 +380,19 @@ class Edge:
     target: str
 
 
+@dataclass(frozen=True)
+class Send:
+    """动态并行分支任务。
+
+    Attributes:
+        node: 分支需要执行的目标节点名称。
+        arg: 合并到当前状态副本后传给目标节点的局部输入。
+    """
+
+    node: str
+    arg: dict[str, Any]
+
+
 @dataclass
 class ConditionalEdge:
     """条件边：根据路由函数的结果动态选择下一个节点。
@@ -398,22 +411,25 @@ def _topological_sort(
     node_names: set[str],
     edges: list[Edge],
     conditional_edges: list[ConditionalEdge],
+    *,
+    allow_cycles: bool = False,
 ) -> list[str]:
     """对图进行拓扑排序，返回节点执行顺序。
 
     将条件边的所有可能路径并入普通边进行保守校验。
-    使用 Kahn 算法。
+    使用 Kahn 算法。允许环时，将无法拓扑排序的节点按名称追加到结果末尾。
 
     Args:
         node_names: 所有节点名称集合。
         edges: 普通边列表。
         conditional_edges: 条件边列表。
+        allow_cycles: 是否允许图中存在环，默认 False。
 
     Returns:
         拓扑排序后的节点名称列表。
 
     Raises:
-        CompileError: 图中存在环时抛出。
+        CompileError: 图中存在环且 allow_cycles=False 时抛出。
     """
     # 收集所有边（普通边 + 条件边的所有可能路径）
     all_edges: list[tuple[str, str]] = [(e.source, e.target) for e in edges]
@@ -431,22 +447,26 @@ def _topological_sort(
             in_degree[target] = in_degree.get(target, 0) + 1
 
     # Kahn 算法
-    queue = [name for name, deg in in_degree.items() if deg == 0]
+    queue = sorted(name for name, deg in in_degree.items() if deg == 0)
     sorted_nodes: list[str] = []
 
     while queue:
         node = queue.pop(0)
         sorted_nodes.append(node)
-        for neighbor in adj[node]:
+        for neighbor in sorted(adj[node]):
             in_degree[neighbor] -= 1
             if in_degree[neighbor] == 0:
                 queue.append(neighbor)
+                queue.sort()
 
     if len(sorted_nodes) != len(node_names):
-        raise CompileError(
-            f"图中检测到环，无法编译。"
-            f"已排序 {len(sorted_nodes)}/{len(node_names)} 个节点。"
-        )
+        if not allow_cycles:
+            raise CompileError(
+                f"图中检测到环，无法编译。"
+                f"已排序 {len(sorted_nodes)}/{len(node_names)} 个节点。"
+            )
+        sorted_set = set(sorted_nodes)
+        sorted_nodes.extend(sorted(node_names - sorted_set))
 
     return sorted_nodes
 
@@ -576,14 +596,17 @@ class StateGraph:
                         f"条件边 '{ce.source}' 的路径 '{key} -> {target}' 目标节点未注册。"
                     )
 
-    def compile(self) -> "CompiledGraph":
+    def compile(self, *, allow_cycles: bool = False) -> "CompiledGraph":
         """编译图：校验合法性，生成拓扑排序，返回 CompiledGraph。
+
+        Args:
+            allow_cycles: 是否允许图中存在环。Agent 循环场景需设为 True。
 
         Returns:
             可执行的 CompiledGraph 实例。
 
         Raises:
-            CompileError: 图不合法或存在环时抛出。
+            CompileError: 图不合法，或存在环且 allow_cycles=False 时抛出。
         """
         self._validate()
 
@@ -593,7 +616,10 @@ class StateGraph:
 
         node_names = set(self._nodes.keys())
         execution_order = _topological_sort(
-            node_names, self._edges, self._conditional_edges,
+            node_names,
+            self._edges,
+            self._conditional_edges,
+            allow_cycles=allow_cycles,
         )
 
         return CompiledGraph(
@@ -671,6 +697,7 @@ class CompiledGraph:
         *,
         persistence: "BasePersistence | None" = None,
         thread_id: str | None = None,
+        config: RunConfig | None = None,
         callback: Callable[[str, dict], None] | None = None,
     ) -> dict:
         """执行图，从入口节点开始，按拓扑顺序执行，到达出口节点后停止。
@@ -679,13 +706,17 @@ class CompiledGraph:
             input: 初始状态字典。
             persistence: 可选的持久化存储实例。启用后每步执行后自动保存 checkpoint。
             thread_id: 线程 ID，用于 checkpoint 关联。不传时自动生成。
+            config: 可选的运行配置。thread_id 参数优先于 config.thread_id。
             callback: 每步执行后的回调，签名 (node_name, state) -> None。
 
         Returns:
             执行完成后的最终状态字典。
         """
         for _node_name, _state in self._run_steps(
-            input, persistence=persistence, thread_id=thread_id,
+            input,
+            persistence=persistence,
+            thread_id=thread_id,
+            config=config,
         ):
             if callback is not None:
                 callback(_node_name, _state)
@@ -697,6 +728,7 @@ class CompiledGraph:
         *,
         persistence: "BasePersistence | None" = None,
         thread_id: str | None = None,
+        config: RunConfig | None = None,
     ) -> Generator[tuple[str, dict], None, dict]:
         """流式执行图，逐节点输出 (node_name, state) 状态变化。
 
@@ -704,6 +736,7 @@ class CompiledGraph:
             input: 初始状态字典。
             persistence: 可选的持久化存储实例。
             thread_id: 线程 ID，用于 checkpoint 关联。
+            config: 可选的运行配置。thread_id 参数优先于 config.thread_id。
 
         Yields:
             (node_name, state) 元组，每次节点执行后输出。
@@ -713,7 +746,10 @@ class CompiledGraph:
         """
         final_state: dict = None  # type: ignore[assignment]
         for name, state in self._run_steps(
-            input, persistence=persistence, thread_id=thread_id,
+            input,
+            persistence=persistence,
+            thread_id=thread_id,
+            config=config,
         ):
             final_state = state
             yield name, state
@@ -726,20 +762,26 @@ class CompiledGraph:
         *,
         persistence: "BasePersistence | None" = None,
         thread_id: str | None = None,
+        config: RunConfig | None = None,
     ) -> Generator[tuple[str, dict], None, dict]:
         """内部生成器：逐步骤执行，产出 (node_name, state) 元组。"""
         state = dict(input)
         current: str | None = self._entry_point
-
+        run_config = _resolve_run_config(config, thread_id)
+        tid = run_config.thread_id or uuid.uuid4().hex
+        step = 0
         persistence_enabled = persistence is not None
-        if persistence_enabled:
-            tid = thread_id or uuid.uuid4().hex
-            step = 0
 
         while current is not None:
+            if step >= run_config.recursion_limit:
+                raise GraphRecursionError(
+                    f"图执行超过最大步数 {run_config.recursion_limit}，"
+                    f"当前节点为 '{current}'。"
+                )
+            step += 1
+
             # 保存 checkpoint（在执行节点前保存，崩溃后可恢复到此节点）
             if persistence_enabled:
-                step += 1
                 cp = Checkpoint(
                     thread_id=tid,
                     step=step,
@@ -828,6 +870,7 @@ class CompiledGraph:
         persistence: "BasePersistence",
         *,
         command: "Command | None" = None,
+        config: RunConfig | None = None,
     ) -> dict:
         """从指定线程的 checkpoint 恢复执行。
 
@@ -837,13 +880,16 @@ class CompiledGraph:
             thread_id: 线程 ID。
             persistence: 持久化存储实例。
             command: 可选的人类指令，可更新状态、重定向节点或终止执行。
+            config: 可选的运行配置。recursion_limit 限制本次恢复执行的节点步数。
 
         Returns:
             执行完成后的最终状态字典。
 
         Raises:
             ValueError: 指定线程的 checkpoint 不存在时抛出。
+            GraphRecursionError: 本次恢复执行超过最大节点步数时抛出。
         """
+        run_config = _resolve_run_config(config, thread_id)
         cp = persistence.get(thread_id)
         if cp is None:
             raise ValueError(f"线程 '{thread_id}' 的 checkpoint 不存在。")
@@ -872,8 +918,16 @@ class CompiledGraph:
             pass
 
         step = cp.step
+        executed_steps = 0
 
         while current is not None:
+            if executed_steps >= run_config.recursion_limit:
+                raise GraphRecursionError(
+                    f"图恢复执行超过最大步数 {run_config.recursion_limit}，"
+                    f"当前节点为 '{current}'。"
+                )
+            executed_steps += 1
+
             # 保存 checkpoint（在执行节点前保存）
             step += 1
             cp = Checkpoint(
@@ -911,6 +965,7 @@ class CompiledGraph:
         *,
         persistence: "BasePersistence | None" = None,
         thread_id: str | None = None,
+        config: RunConfig | None = None,
         callback: Callable[[str, dict], None] | None = None,
     ) -> dict:
         """异步执行图，从入口节点开始，按拓扑顺序执行，到达出口节点后停止。
@@ -919,13 +974,17 @@ class CompiledGraph:
             input: 初始状态字典。
             persistence: 可选的持久化存储实例。启用后每步执行后自动保存 checkpoint。
             thread_id: 线程 ID，用于 checkpoint 关联。不传时自动生成。
+            config: 可选的运行配置。thread_id 参数优先于 config.thread_id。
             callback: 每步执行后的回调，签名 (node_name, state) -> None。
 
         Returns:
             执行完成后的最终状态字典。
         """
         async for _node_name, _state in self._arun_steps(
-            input, persistence=persistence, thread_id=thread_id,
+            input,
+            persistence=persistence,
+            thread_id=thread_id,
+            config=config,
         ):
             if callback is not None:
                 callback(_node_name, _state)
@@ -937,6 +996,7 @@ class CompiledGraph:
         *,
         persistence: "BasePersistence | None" = None,
         thread_id: str | None = None,
+        config: RunConfig | None = None,
     ) -> AsyncGenerator[tuple[str, dict], None]:
         """异步流式执行图，逐节点输出 (node_name, state) 状态变化。
 
@@ -944,16 +1004,20 @@ class CompiledGraph:
             input: 初始状态字典。
             persistence: 可选的持久化存储实例。
             thread_id: 线程 ID，用于 checkpoint 关联。
+            config: 可选的运行配置。thread_id 参数优先于 config.thread_id。
 
         Yields:
             (node_name, state) 元组，每次节点执行后输出。
 
         Note:
-            最终状态可通过返回值获得（在 Python >= 3.12 中通过 `agen.athrow()` 获取）。
+            异步生成器不返回最终值；最后一次产出的 state 即最终状态。
         """
         final_state: dict = None  # type: ignore[assignment]
         async for name, state in self._arun_steps(
-            input, persistence=persistence, thread_id=thread_id,
+            input,
+            persistence=persistence,
+            thread_id=thread_id,
+            config=config,
         ):
             final_state = state
             yield name, state
@@ -967,20 +1031,26 @@ class CompiledGraph:
         *,
         persistence: "BasePersistence | None" = None,
         thread_id: str | None = None,
+        config: RunConfig | None = None,
     ) -> AsyncGenerator[tuple[str, dict], None]:
         """内部异步生成器：逐步骤执行，产出 (node_name, state) 元组。"""
         state = dict(input)
         current: str | None = self._entry_point
-
+        run_config = _resolve_run_config(config, thread_id)
+        tid = run_config.thread_id or uuid.uuid4().hex
+        step = 0
         persistence_enabled = persistence is not None
-        if persistence_enabled:
-            tid = thread_id or uuid.uuid4().hex
-            step = 0
 
         while current is not None:
+            if step >= run_config.recursion_limit:
+                raise GraphRecursionError(
+                    f"图执行超过最大步数 {run_config.recursion_limit}，"
+                    f"当前节点为 '{current}'。"
+                )
+            step += 1
+
             # 保存 checkpoint（在执行节点前保存，崩溃后可恢复到此节点）
             if persistence_enabled:
-                step += 1
                 cp = Checkpoint(
                     thread_id=tid,
                     step=step,
@@ -1053,6 +1123,7 @@ class CompiledGraph:
         persistence: "BasePersistence",
         *,
         command: "Command | None" = None,
+        config: RunConfig | None = None,
     ) -> dict:
         """异步从指定线程的 checkpoint 恢复执行。
 
@@ -1062,13 +1133,16 @@ class CompiledGraph:
             thread_id: 线程 ID。
             persistence: 持久化存储实例。
             command: 可选的人类指令，可更新状态、重定向节点或终止执行。
+            config: 可选的运行配置。recursion_limit 限制本次恢复执行的节点步数。
 
         Returns:
             执行完成后的最终状态字典。
 
         Raises:
             ValueError: 指定线程的 checkpoint 不存在时抛出。
+            GraphRecursionError: 本次恢复执行超过最大节点步数时抛出。
         """
+        run_config = _resolve_run_config(config, thread_id)
         cp = persistence.get(thread_id)
         if cp is None:
             raise ValueError(f"线程 '{thread_id}' 的 checkpoint 不存在。")
@@ -1097,8 +1171,16 @@ class CompiledGraph:
             pass
 
         step = cp.step
+        executed_steps = 0
 
         while current is not None:
+            if executed_steps >= run_config.recursion_limit:
+                raise GraphRecursionError(
+                    f"图恢复执行超过最大步数 {run_config.recursion_limit}，"
+                    f"当前节点为 '{current}'。"
+                )
+            executed_steps += 1
+
             # 保存 checkpoint（在执行节点前保存）
             step += 1
             cp = Checkpoint(

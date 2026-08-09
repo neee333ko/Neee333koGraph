@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from dag import (
     State, Node, Edge, ConditionalEdge,
-    StateGraph, CompiledGraph, CompileError,
+    StateGraph, CompiledGraph, CompileError, GraphRecursionError, RunConfig,
     _merge_state, _parse_reducers,
 )
 
@@ -231,6 +231,24 @@ class TestCompile(unittest.TestCase):
         with self.assertRaises(CompileError):
             g.compile()
 
+    def test_compile_cycle_allowed(self):
+        """验证显式允许环后，条件循环可正常执行并退出。"""
+        g = StateGraph(self.S)
+        g.add_node("loop", self.fn)
+        g.add_node("end", lambda state: None)
+        g.add_conditional_edges(
+            "loop",
+            lambda state: "done" if state["count"] >= 3 else "again",
+            {"again": "loop", "done": "end"},
+        )
+        g.set_entry_point("loop")
+        g.set_finish_point("end")
+
+        app = g.compile(allow_cycles=True)
+        result = app.invoke({"count": 0})
+
+        self.assertEqual(result["count"], 3)
+
     def test_compile_conditional_edge_bad_target(self):
         """验证条件边 path_map 指向未注册节点时抛出异常。"""
         g = self._make_graph()
@@ -324,6 +342,19 @@ class TestInvoke(unittest.TestCase):
         self.assertEqual(result["count"], 1)
         self.assertEqual(result["name"], "test")
 
+    def test_recursion_limit(self):
+        """验证无限循环超过最大步数时抛出明确异常。"""
+        g = StateGraph(self.S)
+        g.add_node("loop", lambda state: {"count": state["count"] + 1})
+        g.add_node("end", lambda state: None)
+        g.add_edge("loop", "loop")
+        g.set_entry_point("loop")
+        g.set_finish_point("end")
+        app = g.compile(allow_cycles=True)
+
+        with self.assertRaisesRegex(GraphRecursionError, "最大步数 3"):
+            app.invoke({"count": 0}, config=RunConfig(recursion_limit=3))
+
 
 class TestAsyncInvoke(unittest.IsolatedAsyncioTestCase):
     """测试异步执行。"""
@@ -366,6 +397,26 @@ class TestAsyncInvoke(unittest.IsolatedAsyncioTestCase):
         app = g.compile()
         result = await app.ainvoke({"count": 1})
         self.assertEqual(result["count"], 4)
+
+    async def test_ainvoke_recursion_limit(self):
+        """验证异步无限循环超过最大步数时抛出明确异常。"""
+        async def a_inc(state: dict) -> dict:
+            await asyncio.sleep(0)
+            return {"count": state["count"] + 1}
+
+        g = StateGraph(self.S)
+        g.add_node("loop", a_inc)
+        g.add_node("end", lambda state: None)
+        g.add_edge("loop", "loop")
+        g.set_entry_point("loop")
+        g.set_finish_point("end")
+        app = g.compile(allow_cycles=True)
+
+        with self.assertRaisesRegex(GraphRecursionError, "最大步数 3"):
+            await app.ainvoke(
+                {"count": 0},
+                config=RunConfig(recursion_limit=3),
+            )
 
     async def test_astream(self):
         """验证异步流式输出。"""
