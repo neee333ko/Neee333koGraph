@@ -4,4 +4,7 @@ __pycache__/
 .checkpoints/
 .demo_checkpoints/
 *.pyc
-tests/
+*.db
+*.egg-info/
+build/
+dist/

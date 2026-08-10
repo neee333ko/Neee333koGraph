@@ -26,6 +26,7 @@ import asyncio
 import copy
 import inspect
 import json
+import sqlite3
 import threading
 import time
 import uuid
@@ -296,6 +297,53 @@ class SubgraphNode:
             return updates
         return result
 
+    async def arun(self, state: dict) -> dict | None:
+        """异步执行子图并将子状态映射回父状态。"""
+        if self.state_mapping:
+            child_state = {
+                child_field: state[parent_field]
+                for parent_field, child_field in self.state_mapping.items()
+                if parent_field in state
+            }
+        else:
+            child_state = dict(state)
+
+        result = await self.subgraph.ainvoke(child_state)
+        if self.state_mapping:
+            return {
+                parent_field: result[child_field]
+                for parent_field, child_field in self.state_mapping.items()
+                if child_field in result
+            }
+        return result
+
+
+def _run_node_sync(node: _NodeProtocol, state: dict) -> dict | None:
+    """同步执行节点，并拒绝未 await 的异步节点。"""
+    result = node.run(state)
+    if inspect.isawaitable(result):
+        if inspect.iscoroutine(result):
+            result.close()
+        raise TypeError(
+            f"节点 '{node.name}' 是异步节点，请使用 ainvoke()。"
+        )
+    return result
+
+
+async def _run_node_async(
+    node: _NodeProtocol,
+    state: dict,
+) -> dict | None:
+    """异步执行节点，并兼容同步节点和异步子图。"""
+    async_runner = getattr(node, "arun", None)
+    if async_runner is not None:
+        return await async_runner(state)
+    if inspect.iscoroutinefunction(node.run):
+        return await node.run(state)
+    if isinstance(node, Node) and inspect.iscoroutinefunction(node.fn):
+        return await node.run(state)
+    return await asyncio.to_thread(_run_node_sync, node, state)
+
 
 def parallel(*fns: Callable[[dict], dict | None]) -> Callable[[dict], dict]:
     """创建一个并行执行节点。
@@ -345,15 +393,21 @@ def with_timeout(
     Returns:
         包装后的节点函数。
     """
+    if seconds <= 0:
+        raise ValueError("seconds 必须大于 0。")
+
     def _wrapped(state: dict) -> dict | None:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(fn, state)
-            try:
-                return future.result(timeout=seconds)
-            except TimeoutError:
-                raise TimeoutError(
-                    f"节点执行超时（{seconds}秒）"
-                ) from None
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(fn, state)
+        try:
+            return future.result(timeout=seconds)
+        except TimeoutError:
+            future.cancel()
+            raise TimeoutError(
+                f"节点执行超时（{seconds}秒）"
+            ) from None
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     return _wrapped
 
@@ -364,6 +418,7 @@ def with_retry(
     max_retries: int = 3,
     delay: float = 1.0,
     backoff: float = 2.0,
+    retry_on: tuple[type[Exception], ...] = (Exception,),
 ) -> Callable[[dict], dict | None]:
     """为节点函数添加自动重试。
 
@@ -374,23 +429,112 @@ def with_retry(
         max_retries: 最大重试次数（不包括首次执行），默认 3。
         delay: 首次重试等待秒数，默认 1.0。
         backoff: 每次重试延迟倍数，默认 2.0（即 1s, 2s, 4s...）。
+        retry_on: 允许重试的异常类型。
 
     Returns:
         包装后的节点函数。
     """
+    if max_retries < 0:
+        raise ValueError("max_retries 不能小于 0。")
+    if delay < 0:
+        raise ValueError("delay 不能小于 0。")
+    if backoff <= 0:
+        raise ValueError("backoff 必须大于 0。")
+
     def _wrapped(state: dict) -> dict | None:
         last_exception: Exception | None = None
         current_delay = delay
         for attempt in range(max_retries + 1):
             try:
                 return fn(state)
-            except Exception as e:
+            except retry_on as e:
                 last_exception = e
                 if attempt < max_retries:
                     time.sleep(current_delay)
                     current_delay *= backoff
         raise RuntimeError(
             f"节点执行失败（已重试 {max_retries} 次）: {last_exception}"
+        ) from last_exception
+
+    return _wrapped
+
+
+def aparallel(*fns: Callable[[dict], Any]) -> Callable[[dict], Any]:
+    """创建支持同步与异步函数的并行节点。"""
+    if not fns:
+        raise ValueError("至少需要提供一个函数。")
+
+    async def _node(state: dict) -> dict:
+        async def invoke(fn: Callable[[dict], Any]) -> dict | None:
+            if inspect.iscoroutinefunction(fn):
+                return await fn(dict(state))
+            return await asyncio.to_thread(fn, dict(state))
+
+        results = await asyncio.gather(*(invoke(fn) for fn in fns))
+        merged: dict = {}
+        for result in results:
+            if result is not None:
+                merged.update(result)
+        return merged
+
+    return _node
+
+
+def awith_timeout(
+    seconds: float,
+    fn: Callable[[dict], Any],
+) -> Callable[[dict], Any]:
+    """为同步或异步节点函数添加异步超时控制。"""
+    if seconds <= 0:
+        raise ValueError("seconds 必须大于 0。")
+
+    async def _wrapped(state: dict) -> dict | None:
+        if inspect.iscoroutinefunction(fn):
+            awaitable = fn(state)
+        else:
+            awaitable = asyncio.to_thread(fn, state)
+        try:
+            return await asyncio.wait_for(awaitable, timeout=seconds)
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"节点执行超时（{seconds}秒）"
+            ) from None
+
+    return _wrapped
+
+
+def awith_retry(
+    fn: Callable[[dict], Any],
+    *,
+    max_retries: int = 3,
+    delay: float = 1.0,
+    backoff: float = 2.0,
+    retry_on: tuple[type[Exception], ...] = (Exception,),
+) -> Callable[[dict], Any]:
+    """为同步或异步节点函数添加异步自动重试。"""
+    if max_retries < 0:
+        raise ValueError("max_retries 不能小于 0。")
+    if delay < 0:
+        raise ValueError("delay 不能小于 0。")
+    if backoff <= 0:
+        raise ValueError("backoff 必须大于 0。")
+
+    async def _wrapped(state: dict) -> dict | None:
+        last_exception: Exception | None = None
+        current_delay = delay
+        for attempt in range(max_retries + 1):
+            try:
+                if inspect.iscoroutinefunction(fn):
+                    return await fn(state)
+                return await asyncio.to_thread(fn, state)
+            except retry_on as error:
+                last_exception = error
+                if attempt < max_retries:
+                    await asyncio.sleep(current_delay)
+                    current_delay *= backoff
+        raise RuntimeError(
+            f"节点执行失败（已重试 {max_retries} 次）: "
+            f"{last_exception}"
         ) from last_exception
 
     return _wrapped
@@ -901,6 +1045,7 @@ class CompiledGraph:
                     step=step,
                     state=state,
                     next_node=current,
+                    metadata=dict(run_config.metadata),
                 )
                 persistence.put(tid, cp)
 
@@ -913,6 +1058,7 @@ class CompiledGraph:
                         state=state,
                         next_node=current,
                         reason="breakpoint",
+                        metadata=dict(run_config.metadata),
                     )
                     persistence.put(tid, final_cp)
                 yield current, state
@@ -921,7 +1067,7 @@ class CompiledGraph:
             # 执行当前节点
             node = self._nodes[current]
             try:
-                updates = node.run(state)
+                updates = _run_node_sync(node, state)
             except NodeInterrupt:
                 if persistence_enabled:
                     final_cp = Checkpoint(
@@ -930,6 +1076,7 @@ class CompiledGraph:
                         state=state,
                         next_node=current,
                         reason="interrupt",
+                        metadata=dict(run_config.metadata),
                     )
                     persistence.put(tid, final_cp)
                 yield current, state
@@ -949,6 +1096,7 @@ class CompiledGraph:
                         state=state,
                         next_node=None,
                         reason="checkpoint",
+                        metadata=dict(run_config.metadata),
                     )
                     persistence.put(tid, cp)
                 break
@@ -1040,13 +1188,7 @@ class CompiledGraph:
 
         branch_state = dict(state)
         branch_state.update(send.arg)
-        updates = self._nodes[send.node].run(branch_state)
-        if inspect.isawaitable(updates):
-            if inspect.iscoroutine(updates):
-                updates.close()
-            raise TypeError(
-                f"Send 目标节点 '{send.node}' 是异步节点，请使用 ainvoke()。"
-            )
+        updates = _run_node_sync(self._nodes[send.node], branch_state)
 
         branch_state = _merge_state(branch_state, updates, self._reducers)
         continuation = self._get_next_node(send.node, branch_state)
@@ -1116,11 +1258,10 @@ class CompiledGraph:
 
         branch_state = dict(state)
         branch_state.update(send.arg)
-        result = self._nodes[send.node].run(branch_state)
-        if inspect.isawaitable(result):
-            updates = await result
-        else:
-            updates = result
+        updates = await _run_node_async(
+            self._nodes[send.node],
+            branch_state,
+        )
 
         branch_state = _merge_state(branch_state, updates, self._reducers)
         continuation = self._get_next_node(send.node, branch_state)
@@ -1257,6 +1398,7 @@ class CompiledGraph:
                         step=step,
                         state=state,
                         next_node=continuation,
+                        metadata=dict(run_config.metadata),
                     )
                     persistence.put(thread_id, cp)
                 current = continuation
@@ -1276,12 +1418,13 @@ class CompiledGraph:
                 step=step,
                 state=state,
                 next_node=current,
+                metadata=dict(run_config.metadata),
             )
             persistence.put(thread_id, cp)
 
             # 执行当前节点
             node = self._nodes[current]
-            updates = node.run(state)
+            updates = _run_node_sync(node, state)
             state = _merge_state(state, updates, self._reducers)
 
             # 到达出口节点则停止
@@ -1291,6 +1434,7 @@ class CompiledGraph:
                     step=step,
                     state=state,
                     next_node=None,
+                    metadata=dict(run_config.metadata),
                 )
                 persistence.put(thread_id, cp)
                 break
@@ -1307,7 +1451,7 @@ class CompiledGraph:
         persistence: "BasePersistence | None" = None,
         thread_id: str | None = None,
         config: RunConfig | None = None,
-        callback: Callable[[str, dict], None] | None = None,
+        callback: Callable[[str, dict], Any] | None = None,
     ) -> dict:
         """异步执行图，从入口节点开始，按拓扑顺序执行，到达出口节点后停止。
 
@@ -1328,7 +1472,9 @@ class CompiledGraph:
             config=config,
         ):
             if callback is not None:
-                callback(_node_name, _state)
+                callback_result = callback(_node_name, _state)
+                if inspect.isawaitable(callback_result):
+                    await callback_result
         return _state
 
     async def astream(
@@ -1472,8 +1618,9 @@ class CompiledGraph:
                     step=step,
                     state=state,
                     next_node=current,
+                    metadata=dict(run_config.metadata),
                 )
-                persistence.put(tid, cp)
+                await persistence.aput(tid, cp)
 
             # 检查运行时断点
             if current in self._breakpoints:
@@ -1484,19 +1631,16 @@ class CompiledGraph:
                         state=state,
                         next_node=current,
                         reason="breakpoint",
+                        metadata=dict(run_config.metadata),
                     )
-                    persistence.put(tid, final_cp)
+                    await persistence.aput(tid, final_cp)
                 yield current, state
                 return
 
             # 执行当前节点
             node = self._nodes[current]
             try:
-                result = node.run(state)
-                if inspect.iscoroutine(result):
-                    updates = await result
-                else:
-                    updates = result
+                updates = await _run_node_async(node, state)
             except NodeInterrupt:
                 if persistence_enabled:
                     final_cp = Checkpoint(
@@ -1505,8 +1649,9 @@ class CompiledGraph:
                         state=state,
                         next_node=current,
                         reason="interrupt",
+                        metadata=dict(run_config.metadata),
                     )
-                    persistence.put(tid, final_cp)
+                    await persistence.aput(tid, final_cp)
                 yield current, state
                 return
 
@@ -1524,8 +1669,9 @@ class CompiledGraph:
                         state=state,
                         next_node=None,
                         reason="checkpoint",
+                        metadata=dict(run_config.metadata),
                     )
-                    persistence.put(tid, cp)
+                    await persistence.aput(tid, cp)
                 break
 
             # 查找下一个节点或动态并行分支
@@ -1585,7 +1731,7 @@ class CompiledGraph:
             GraphRecursionError: 本次恢复执行超过最大节点步数时抛出。
         """
         run_config = _resolve_run_config(config, thread_id)
-        cp = persistence.get(thread_id)
+        cp = await persistence.aget(thread_id)
         if cp is None:
             raise ValueError(f"线程 '{thread_id}' 的 checkpoint 不存在。")
 
@@ -1645,8 +1791,9 @@ class CompiledGraph:
                         step=step,
                         state=state,
                         next_node=continuation,
+                        metadata=dict(run_config.metadata),
                     )
-                    persistence.put(thread_id, cp)
+                    await persistence.aput(thread_id, cp)
                 current = continuation
                 continue
 
@@ -1664,16 +1811,13 @@ class CompiledGraph:
                 step=step,
                 state=state,
                 next_node=current,
+                metadata=dict(run_config.metadata),
             )
-            persistence.put(thread_id, cp)
+            await persistence.aput(thread_id, cp)
 
             # 执行当前节点
             node = self._nodes[current]
-            result = node.run(state)
-            if inspect.iscoroutine(result):
-                updates = await result
-            else:
-                updates = result
+            updates = await _run_node_async(node, state)
             state = _merge_state(state, updates, self._reducers)
 
             # 到达出口节点则停止
@@ -1683,8 +1827,9 @@ class CompiledGraph:
                     step=step,
                     state=state,
                     next_node=None,
+                    metadata=dict(run_config.metadata),
                 )
-                persistence.put(thread_id, cp)
+                await persistence.aput(thread_id, cp)
                 break
 
             # 查找下一个节点
@@ -1768,6 +1913,31 @@ class BasePersistence(abc.ABC):
         checkpoint = self.get(thread_id)
         return [checkpoint] if checkpoint is not None else []
 
+    async def aput(
+        self,
+        thread_id: str,
+        checkpoint: Checkpoint,
+    ) -> None:
+        """在线程池中异步保存 checkpoint。"""
+        await asyncio.to_thread(self.put, thread_id, checkpoint)
+
+    async def aget(self, thread_id: str) -> Checkpoint | None:
+        """在线程池中异步加载最新 checkpoint。"""
+        return await asyncio.to_thread(self.get, thread_id)
+
+    async def ahistory(
+        self,
+        thread_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[Checkpoint]:
+        """在线程池中异步查询 checkpoint 历史。"""
+        return await asyncio.to_thread(
+            self.history,
+            thread_id,
+            limit=limit,
+        )
+
 
 class MemoryPersistence(BasePersistence):
     """线程安全的内存 checkpoint 历史存储。"""
@@ -1810,6 +1980,161 @@ class MemoryPersistence(BasePersistence):
             return copy.deepcopy(checkpoints)
 
 
+class SQLitePersistence(BasePersistence):
+    """基于 SQLite 的线程安全 checkpoint 历史存储。"""
+
+    def __init__(self, database: str | Path = "./checkpoints.db") -> None:
+        self._database = str(database)
+        if self._database != ":memory:":
+            Path(self._database).expanduser().parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+        self._lock = threading.RLock()
+        self._connection = sqlite3.connect(
+            self._database,
+            check_same_thread=False,
+        )
+        self._connection.row_factory = sqlite3.Row
+        with self._connection:
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            self._connection.execute("PRAGMA synchronous=NORMAL")
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    checkpoint_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    step INTEGER NOT NULL,
+                    state_json TEXT NOT NULL,
+                    next_node TEXT,
+                    reason TEXT NOT NULL,
+                    parent_id TEXT,
+                    created_at REAL NOT NULL,
+                    metadata_json TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_checkpoints_thread_step
+                ON checkpoints (thread_id, step DESC, created_at DESC)
+                """
+            )
+
+    def put(self, thread_id: str, checkpoint: Checkpoint) -> None:
+        """在事务中保存 checkpoint 并建立同线程父链。"""
+        if checkpoint.thread_id != thread_id:
+            raise ValueError("checkpoint.thread_id 与存储 thread_id 不一致。")
+        with self._lock, self._connection:
+            if checkpoint.parent_id is None:
+                row = self._connection.execute(
+                    """
+                    SELECT checkpoint_id
+                    FROM checkpoints
+                    WHERE thread_id = ?
+                    ORDER BY step DESC, created_at DESC
+                    LIMIT 1
+                    """,
+                    (thread_id,),
+                ).fetchone()
+                if row is not None:
+                    checkpoint.parent_id = row["checkpoint_id"]
+            self._connection.execute(
+                """
+                INSERT OR REPLACE INTO checkpoints (
+                    checkpoint_id,
+                    thread_id,
+                    step,
+                    state_json,
+                    next_node,
+                    reason,
+                    parent_id,
+                    created_at,
+                    metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    checkpoint.checkpoint_id,
+                    thread_id,
+                    checkpoint.step,
+                    json.dumps(checkpoint.state, ensure_ascii=False),
+                    checkpoint.next_node,
+                    checkpoint.reason,
+                    checkpoint.parent_id,
+                    checkpoint.created_at,
+                    json.dumps(checkpoint.metadata, ensure_ascii=False),
+                ),
+            )
+
+    def get(self, thread_id: str) -> Checkpoint | None:
+        """加载指定线程的最新 checkpoint。"""
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT *
+                FROM checkpoints
+                WHERE thread_id = ?
+                ORDER BY step DESC, created_at DESC
+                LIMIT 1
+                """,
+                (thread_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return Checkpoint(
+            thread_id=row["thread_id"],
+            step=row["step"],
+            state=json.loads(row["state_json"]),
+            next_node=row["next_node"],
+            reason=row["reason"],
+            checkpoint_id=row["checkpoint_id"],
+            parent_id=row["parent_id"],
+            created_at=row["created_at"],
+            metadata=json.loads(row["metadata_json"]),
+        )
+
+    def history(
+        self,
+        thread_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[Checkpoint]:
+        """按最新优先查询指定线程的 checkpoint 历史。"""
+        if limit is not None and limit <= 0:
+            return []
+        sql = """
+            SELECT *
+            FROM checkpoints
+            WHERE thread_id = ?
+            ORDER BY step DESC, created_at DESC
+        """
+        parameters: tuple[Any, ...] = (thread_id,)
+        if limit is not None:
+            sql += " LIMIT ?"
+            parameters = (thread_id, limit)
+        with self._lock:
+            rows = self._connection.execute(sql, parameters).fetchall()
+        return [
+            Checkpoint(
+                thread_id=row["thread_id"],
+                step=row["step"],
+                state=json.loads(row["state_json"]),
+                next_node=row["next_node"],
+                reason=row["reason"],
+                checkpoint_id=row["checkpoint_id"],
+                parent_id=row["parent_id"],
+                created_at=row["created_at"],
+                metadata=json.loads(row["metadata_json"]),
+            )
+            for row in rows
+        ]
+
+    def close(self) -> None:
+        """关闭 SQLite 连接。"""
+        with self._lock:
+            self._connection.close()
+
+
 class FilePersistence(BasePersistence):
     """基于文件系统的持久化存储。
 
@@ -1821,8 +2146,19 @@ class FilePersistence(BasePersistence):
         self._base_dir = Path(base_dir)
         self._base_dir.mkdir(parents=True, exist_ok=True)
 
+    def _path_for_thread(self, thread_id: str) -> Path:
+        """返回安全的线程 checkpoint 路径。"""
+        if (
+            not thread_id
+            or Path(thread_id).name != thread_id
+            or "/" in thread_id
+            or "\\" in thread_id
+        ):
+            raise ValueError("thread_id 不能包含路径分隔符。")
+        return self._base_dir / f"{thread_id}.json"
+
     def put(self, thread_id: str, checkpoint: Checkpoint) -> None:
-        file_path = self._base_dir / f"{thread_id}.json"
+        file_path = self._path_for_thread(thread_id)
         if checkpoint.parent_id is None and file_path.exists():
             with open(file_path, encoding="utf-8") as existing_file:
                 existing_data = json.load(existing_file)
@@ -1845,7 +2181,7 @@ class FilePersistence(BasePersistence):
         temporary_path.replace(file_path)
 
     def get(self, thread_id: str) -> Checkpoint | None:
-        file_path = self._base_dir / f"{thread_id}.json"
+        file_path = self._path_for_thread(thread_id)
         if not file_path.exists():
             return None
         with open(file_path, encoding="utf-8") as input_file:

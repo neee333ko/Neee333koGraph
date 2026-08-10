@@ -24,6 +24,9 @@ LLM 根据用户问题选择工具并生成参数，框架自动执行工具并�
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from dag_llm import _resolve_api_key
+from typing import Any
+import asyncio
+import inspect
 import json
 import urllib.error
 import urllib.request
@@ -41,7 +44,7 @@ class Tool:
     """
     name: str
     description: str
-    fn: Callable[..., str]
+    fn: Callable[..., Any]
     parameters: dict = field(default_factory=dict)
 
 
@@ -55,6 +58,7 @@ def tool_node(
     response_key: str = "tool_result",
     system_prompt: str = "你是一个助手，根据用户问题选择合适的工具并调用。",
     temperature: float = 0.1,
+    timeout: float = 60.0,
 ) -> Callable[[dict], dict]:
     """创建一个 Agent 节点：LLM 选择工具 → 执行工具 → 结果回写状态。
 
@@ -67,6 +71,7 @@ def tool_node(
         response_key: 工具结果写入 state 的字段名。
         system_prompt: 系统提示词。
         temperature: 温度参数，工具调用建议用较低值。
+        timeout: LLM HTTP 请求超时秒数。
 
     Returns:
         节点函数，签名 (state: dict) -> dict。
@@ -87,30 +92,98 @@ def tool_node(
         ]
 
         # 调用 LLM 获取工具选择
-        tool_call = _call_llm_with_tools(
+        tool_calls = _call_llm_with_tools(
             messages=messages,
             model=llm_model,
             api_key=resolved_key,
             base_url=resolved_base_url,
             tools=tool_defs,
             temperature=temperature,
+            timeout=timeout,
         )
 
-        if tool_call is None:
+        if not tool_calls:
             return {response_key: "LLM 未选择任何工具"}
 
-        # 查找并执行工具
-        tool_name = tool_call["name"]
-        tool_args = tool_call["arguments"]
-
-        matched = next((t for t in tools if t.name == tool_name), None)
-        if matched is None:
-            raise ValueError(f"未知工具: {tool_name}")
-
-        result = matched.fn(**tool_args)
-        return {response_key: result}
+        results = [
+            _execute_tool_call(tools, tool_call)
+            for tool_call in tool_calls
+        ]
+        value: Any = results[0] if len(results) == 1 else results
+        return {response_key: value}
 
     return _node
+
+
+def atool_node(
+    tools: list[Tool],
+    *,
+    llm_model: str = "gpt-4o",
+    api_key: str | None = None,
+    base_url: str | None = None,
+    input_key: str = "input",
+    response_key: str = "tool_result",
+    system_prompt: str = "你是一个助手，根据用户问题选择合适的工具并调用。",
+    temperature: float = 0.1,
+    timeout: float = 60.0,
+) -> Callable[[dict], Any]:
+    """创建支持异步 LLM 和异步工具的 Tool Node。"""
+    if not tools:
+        raise ValueError("至少需要提供一个工具。")
+
+    resolved_base_url = base_url or "https://api.openai.com/v1"
+    tool_defs = _format_tools(tools)
+
+    async def _node(state: dict) -> dict:
+        resolved_key = _resolve_api_key(api_key)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": str(state.get(input_key, ""))},
+        ]
+        tool_calls = await asyncio.to_thread(
+            _call_llm_with_tools,
+            messages,
+            llm_model,
+            resolved_key,
+            resolved_base_url,
+            tool_defs,
+            temperature,
+            timeout,
+        )
+        if not tool_calls:
+            return {response_key: "LLM 未选择任何工具"}
+        results = await asyncio.gather(
+            *(_aexecute_tool_call(tools, tool_call) for tool_call in tool_calls)
+        )
+        value: Any = results[0] if len(results) == 1 else list(results)
+        return {response_key: value}
+
+    return _node
+
+
+def _execute_tool_call(tools: list[Tool], tool_call: dict) -> Any:
+    """同步执行单个工具调用。"""
+    tool_name = tool_call["name"]
+    matched = next((tool for tool in tools if tool.name == tool_name), None)
+    if matched is None:
+        raise ValueError(f"未知工具: {tool_name}")
+    result = matched.fn(**tool_call["arguments"])
+    if inspect.isawaitable(result):
+        if inspect.iscoroutine(result):
+            result.close()
+        raise TypeError(f"工具 '{tool_name}' 是异步工具，请使用 atool_node()。")
+    return result
+
+
+async def _aexecute_tool_call(tools: list[Tool], tool_call: dict) -> Any:
+    """异步执行单个工具调用，并兼容同步工具。"""
+    tool_name = tool_call["name"]
+    matched = next((tool for tool in tools if tool.name == tool_name), None)
+    if matched is None:
+        raise ValueError(f"未知工具: {tool_name}")
+    if inspect.iscoroutinefunction(matched.fn):
+        return await matched.fn(**tool_call["arguments"])
+    return await asyncio.to_thread(matched.fn, **tool_call["arguments"])
 
 
 def _format_tools(tools: list[Tool]) -> list[dict]:
@@ -135,7 +208,8 @@ def _call_llm_with_tools(
     base_url: str,
     tools: list[dict],
     temperature: float,
-) -> dict | None:
+    timeout: float = 60.0,
+) -> list[dict]:
     """调用 LLM 并解析工具调用结果。
 
     Args:
@@ -147,7 +221,7 @@ def _call_llm_with_tools(
         temperature: 温度参数。
 
     Returns:
-        {name, arguments} 或 None（未选择工具）。
+        {name, arguments, id} 列表；未选择工具时返回空列表。
 
     Raises:
         RuntimeError: API 调用失败或响应格式异常时抛出。
@@ -171,7 +245,7 @@ def _call_llm_with_tools(
     )
 
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -193,10 +267,19 @@ def _call_llm_with_tools(
     # 解析 tool_calls
     tool_calls = message.get("tool_calls")
     if not tool_calls:
-        return None
+        return []
 
-    tc = tool_calls[0]
-    return {
-        "name": tc["function"]["name"],
-        "arguments": json.loads(tc["function"]["arguments"]),
-    }
+    parsed_calls = []
+    for tool_call in tool_calls:
+        try:
+            arguments = json.loads(tool_call["function"]["arguments"])
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"工具调用参数格式异常: {tool_call}"
+            ) from error
+        parsed_calls.append({
+            "id": tool_call.get("id"),
+            "name": tool_call["function"]["name"],
+            "arguments": arguments,
+        })
+    return parsed_calls

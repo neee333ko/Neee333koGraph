@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nekograph"
+version = "0.2.0"
+description = "A lightweight stateful graph runtime for multi-agent systems"
+requires-python = ">=3.10"
+authors = [
+    { name = "Neee333koGraph" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pyright>=1.1",
+]
+
+[tool.setuptools]
+py-modules = [
+    "dag",
+    "dag_agents",
+    "dag_llm",
+    "dag_store",
+    "dag_tools",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nekograph*"]
+
+[tool.pyright]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
+include = [
+    "dag.py",
+    "dag_agents.py",
+    "dag_llm.py",
+    "dag_store.py",
+    "dag_tools.py",
+    "nekograph",
+]
