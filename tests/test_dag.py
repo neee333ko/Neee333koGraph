@@ -3,7 +3,7 @@
 import asyncio
 import unittest
 from dag import (
-    State, Node, Edge, ConditionalEdge,
+    State, Node, Edge, ConditionalEdge, Checkpoint, MemoryPersistence,
     StateGraph, CompiledGraph, CompileError, GraphRecursionError, RunConfig, Send,
     _merge_state, _parse_reducers,
 )
@@ -777,6 +777,51 @@ class TestStateReducer(unittest.TestCase):
 
         result = asyncio.run(run())
         self.assertEqual(result["messages"], ["start", "hello"])
+
+
+class TestMemoryPersistence(unittest.TestCase):
+    """测试内存 checkpoint 历史存储。"""
+
+    def test_memory_persistence_history(self):
+        """验证最新读取、历史顺序、父链和快照隔离。"""
+        persistence = MemoryPersistence()
+        for step in range(1, 4):
+            persistence.put(
+                "room",
+                Checkpoint(
+                    thread_id="room",
+                    step=step,
+                    state={"items": [step]},
+                    next_node="work",
+                ),
+            )
+
+        latest = persistence.get("room")
+        self.assertIsNotNone(latest)
+        assert latest is not None
+        self.assertEqual(latest.step, 3)
+
+        history = persistence.history("room")
+        self.assertEqual(
+            [checkpoint.step for checkpoint in history],
+            [3, 2, 1],
+        )
+        self.assertEqual(
+            history[0].parent_id,
+            history[1].checkpoint_id,
+        )
+        self.assertEqual(
+            [checkpoint.step for checkpoint in persistence.history(
+                "room",
+                limit=2,
+            )],
+            [3, 2],
+        )
+
+        history[0].state["items"].append(99)
+        stored = persistence.get("room")
+        assert stored is not None
+        self.assertEqual(stored.state, {"items": [3]})
 
 
 if __name__ == "__main__":

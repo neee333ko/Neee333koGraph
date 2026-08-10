@@ -23,8 +23,10 @@ from typing import (
 )
 import abc
 import asyncio
+import copy
 import inspect
 import json
+import threading
 import time
 import uuid
 
@@ -1765,6 +1767,47 @@ class BasePersistence(abc.ABC):
             return []
         checkpoint = self.get(thread_id)
         return [checkpoint] if checkpoint is not None else []
+
+
+class MemoryPersistence(BasePersistence):
+    """线程安全的内存 checkpoint 历史存储。"""
+
+    def __init__(self) -> None:
+        self._checkpoints: dict[str, list[Checkpoint]] = {}
+        self._lock = threading.RLock()
+
+    def put(self, thread_id: str, checkpoint: Checkpoint) -> None:
+        """保存 checkpoint 深拷贝并建立同线程父链。"""
+        if checkpoint.thread_id != thread_id:
+            raise ValueError("checkpoint.thread_id 与存储 thread_id 不一致。")
+        with self._lock:
+            history = self._checkpoints.setdefault(thread_id, [])
+            if checkpoint.parent_id is None and history:
+                checkpoint.parent_id = history[-1].checkpoint_id
+            history.append(copy.deepcopy(checkpoint))
+
+    def get(self, thread_id: str) -> Checkpoint | None:
+        """加载指定线程的最新 checkpoint 深拷贝。"""
+        with self._lock:
+            history = self._checkpoints.get(thread_id)
+            if not history:
+                return None
+            return copy.deepcopy(history[-1])
+
+    def history(
+        self,
+        thread_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[Checkpoint]:
+        """按最新优先返回指定线程的 checkpoint 历史深拷贝。"""
+        if limit is not None and limit <= 0:
+            return []
+        with self._lock:
+            checkpoints = list(reversed(self._checkpoints.get(thread_id, [])))
+            if limit is not None:
+                checkpoints = checkpoints[:limit]
+            return copy.deepcopy(checkpoints)
 
 
 class FilePersistence(BasePersistence):
