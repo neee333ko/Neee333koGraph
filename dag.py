@@ -99,6 +99,31 @@ class RunConfig:
     context: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class StreamEvent:
+    """图执行过程中产出的结构化事件。
+
+    Attributes:
+        event: 事件类型。
+        run_id: 单次执行的唯一 ID。
+        thread_id: 关联 checkpoint 的线程 ID。
+        step: 当前执行步数。
+        node: 关联节点名称；运行级事件为 None。
+        data: 事件载荷。
+        metadata: 调用方提供的运行元数据。
+        timestamp: Unix 时间戳。
+    """
+
+    event: str
+    run_id: str
+    thread_id: str | None
+    step: int
+    node: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+
+
 def _resolve_run_config(
     config: RunConfig | None,
     thread_id: str | None = None,
@@ -764,6 +789,85 @@ class CompiledGraph:
         assert final_state is not None
         return final_state
 
+    def stream_events(
+        self,
+        input: dict,
+        *,
+        persistence: "BasePersistence | None" = None,
+        thread_id: str | None = None,
+        config: RunConfig | None = None,
+    ) -> Generator[StreamEvent, None, dict]:
+        """同步执行图并产出结构化运行事件。
+
+        Args:
+            input: 初始状态字典。
+            persistence: 可选的持久化存储实例。
+            thread_id: 线程 ID，用于 checkpoint 关联。
+            config: 可选的运行配置。thread_id 参数优先于 config.thread_id。
+
+        Yields:
+            run_start、node_end、run_end 或 run_error 事件。
+
+        Returns:
+            执行完成后的最终状态字典。
+        """
+        run_id = uuid.uuid4().hex
+        run_config = _resolve_run_config(config, thread_id)
+        effective_thread_id = run_config.thread_id or run_id
+        metadata = dict(run_config.metadata)
+        step = 0
+        final_state = dict(input)
+
+        yield StreamEvent(
+            event="run_start",
+            run_id=run_id,
+            thread_id=effective_thread_id,
+            step=step,
+            data={"input": dict(input)},
+            metadata=dict(metadata),
+        )
+        try:
+            for node_name, state in self._run_steps(
+                input,
+                persistence=persistence,
+                thread_id=effective_thread_id,
+                config=run_config,
+            ):
+                step += 1
+                final_state = state
+                yield StreamEvent(
+                    event="node_end",
+                    run_id=run_id,
+                    thread_id=effective_thread_id,
+                    step=step,
+                    node=node_name,
+                    data={"state": dict(state)},
+                    metadata=dict(metadata),
+                )
+        except Exception as error:
+            yield StreamEvent(
+                event="run_error",
+                run_id=run_id,
+                thread_id=effective_thread_id,
+                step=step,
+                data={
+                    "error": str(error),
+                    "error_type": type(error).__name__,
+                },
+                metadata=dict(metadata),
+            )
+            raise
+
+        yield StreamEvent(
+            event="run_end",
+            run_id=run_id,
+            thread_id=effective_thread_id,
+            step=step,
+            data={"state": dict(final_state)},
+            metadata=dict(metadata),
+        )
+        return final_state
+
     def _run_steps(
         self,
         input: dict,
@@ -1259,6 +1363,81 @@ class CompiledGraph:
         assert final_state is not None
         # async generator cannot return a value, but we don't need it anyway
         return
+
+    async def astream_events(
+        self,
+        input: dict,
+        *,
+        persistence: "BasePersistence | None" = None,
+        thread_id: str | None = None,
+        config: RunConfig | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """异步执行图并产出结构化运行事件。
+
+        Args:
+            input: 初始状态字典。
+            persistence: 可选的持久化存储实例。
+            thread_id: 线程 ID，用于 checkpoint 关联。
+            config: 可选的运行配置。thread_id 参数优先于 config.thread_id。
+
+        Yields:
+            run_start、node_end、run_end 或 run_error 事件。
+        """
+        run_id = uuid.uuid4().hex
+        run_config = _resolve_run_config(config, thread_id)
+        effective_thread_id = run_config.thread_id or run_id
+        metadata = dict(run_config.metadata)
+        step = 0
+        final_state = dict(input)
+
+        yield StreamEvent(
+            event="run_start",
+            run_id=run_id,
+            thread_id=effective_thread_id,
+            step=step,
+            data={"input": dict(input)},
+            metadata=dict(metadata),
+        )
+        try:
+            async for node_name, state in self._arun_steps(
+                input,
+                persistence=persistence,
+                thread_id=effective_thread_id,
+                config=run_config,
+            ):
+                step += 1
+                final_state = state
+                yield StreamEvent(
+                    event="node_end",
+                    run_id=run_id,
+                    thread_id=effective_thread_id,
+                    step=step,
+                    node=node_name,
+                    data={"state": dict(state)},
+                    metadata=dict(metadata),
+                )
+        except Exception as error:
+            yield StreamEvent(
+                event="run_error",
+                run_id=run_id,
+                thread_id=effective_thread_id,
+                step=step,
+                data={
+                    "error": str(error),
+                    "error_type": type(error).__name__,
+                },
+                metadata=dict(metadata),
+            )
+            raise
+
+        yield StreamEvent(
+            event="run_end",
+            run_id=run_id,
+            thread_id=effective_thread_id,
+            step=step,
+            data={"state": dict(final_state)},
+            metadata=dict(metadata),
+        )
 
     async def _arun_steps(
         self,

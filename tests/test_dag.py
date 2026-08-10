@@ -404,6 +404,64 @@ class TestInvoke(unittest.TestCase):
         )
         self.assertEqual(steps[-1][1]["summary"], 3)
 
+    def test_stream_events(self):
+        """验证同步结构化事件流及异常事件。"""
+        g = StateGraph(self.S)
+        g.add_node("inc", lambda state: {"count": state["count"] + 1})
+        g.add_node("end", lambda state: None)
+        g.add_edge("inc", "end")
+        g.set_entry_point("inc")
+        g.set_finish_point("end")
+
+        events = list(g.compile().stream_events(
+            {"count": 0},
+            config=RunConfig(
+                thread_id="room-1",
+                metadata={"room_id": 1},
+            ),
+        ))
+
+        self.assertEqual(
+            [event.event for event in events],
+            ["run_start", "node_end", "node_end", "run_end"],
+        )
+        self.assertEqual(
+            [event.node for event in events],
+            [None, "inc", "end", None],
+        )
+        self.assertEqual(events[-1].data["state"], {"count": 1})
+        self.assertTrue(
+            all(event.thread_id == "room-1" for event in events)
+        )
+        self.assertTrue(
+            all(event.metadata == {"room_id": 1} for event in events)
+        )
+
+        def fail(state: dict) -> dict:
+            raise ValueError("analysis failed")
+
+        failed = StateGraph(self.S)
+        failed.add_node("fail", fail)
+        failed.add_node("end", lambda state: None)
+        failed.add_edge("fail", "end")
+        failed.set_entry_point("fail")
+        failed.set_finish_point("end")
+
+        error_events = []
+        event_stream = failed.compile().stream_events({"count": 0})
+        with self.assertRaisesRegex(ValueError, "analysis failed"):
+            while True:
+                error_events.append(next(event_stream))
+
+        self.assertEqual(
+            [event.event for event in error_events],
+            ["run_start", "run_error"],
+        )
+        self.assertEqual(
+            error_events[-1].data["error_type"],
+            "ValueError",
+        )
+
 
 class TestAsyncInvoke(unittest.IsolatedAsyncioTestCase):
     """测试异步执行。"""
@@ -523,6 +581,66 @@ class TestAsyncInvoke(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["summary"], 5)
         self.assertEqual(peak, 2)
+
+    async def test_astream_events(self):
+        """验证异步结构化事件流及异常事件。"""
+        async def increment(state: dict) -> dict:
+            await asyncio.sleep(0)
+            return {"count": state["count"] + 1}
+
+        g = StateGraph(self.S)
+        g.add_node("inc", increment)
+        g.add_node("end", lambda state: None)
+        g.add_edge("inc", "end")
+        g.set_entry_point("inc")
+        g.set_finish_point("end")
+
+        events = []
+        async for event in g.compile().astream_events(
+            {"count": 0},
+            config=RunConfig(
+                thread_id="room-async",
+                metadata={"mode": "live"},
+            ),
+        ):
+            events.append(event)
+
+        self.assertEqual(
+            [event.event for event in events],
+            ["run_start", "node_end", "node_end", "run_end"],
+        )
+        self.assertEqual(events[-1].data["state"], {"count": 1})
+        self.assertTrue(
+            all(event.thread_id == "room-async" for event in events)
+        )
+        self.assertTrue(
+            all(event.metadata == {"mode": "live"} for event in events)
+        )
+
+        async def fail(state: dict) -> dict:
+            await asyncio.sleep(0)
+            raise ValueError("async analysis failed")
+
+        failed = StateGraph(self.S)
+        failed.add_node("fail", fail)
+        failed.add_node("end", lambda state: None)
+        failed.add_edge("fail", "end")
+        failed.set_entry_point("fail")
+        failed.set_finish_point("end")
+
+        error_events = []
+        with self.assertRaisesRegex(ValueError, "async analysis failed"):
+            async for event in failed.compile().astream_events({"count": 0}):
+                error_events.append(event)
+
+        self.assertEqual(
+            [event.event for event in error_events],
+            ["run_start", "run_error"],
+        )
+        self.assertEqual(
+            error_events[-1].data["error_type"],
+            "ValueError",
+        )
 
     async def test_astream(self):
         """验证异步流式输出。"""
