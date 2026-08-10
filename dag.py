@@ -1701,12 +1701,20 @@ class Checkpoint:
         state: 当前状态快照。
         next_node: 下一步待执行的节点名称。None 表示执行已完成。
         reason: 暂停原因。"checkpoint"（正常保存）、"interrupt"（中断）、"breakpoint"（断点）。
+        checkpoint_id: checkpoint 唯一 ID。
+        parent_id: 上一个 checkpoint ID，用于构建版本链。
+        created_at: checkpoint 创建时间戳。
+        metadata: 运行与审计元数据。
     """
     thread_id: str
     step: int
     state: dict
     next_node: str | None
     reason: str = "checkpoint"
+    checkpoint_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    parent_id: str | None = None
+    created_at: float = field(default_factory=time.time)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -1736,6 +1744,28 @@ class BasePersistence(abc.ABC):
         """加载指定线程的最新 checkpoint。"""
         ...
 
+    def history(
+        self,
+        thread_id: str,
+        *,
+        limit: int | None = None,
+    ) -> list[Checkpoint]:
+        """按最新优先返回指定线程的 checkpoint 历史。
+
+        默认实现仅返回 get() 提供的最新 checkpoint，保证旧后端兼容。
+
+        Args:
+            thread_id: 线程 ID。
+            limit: 最多返回数量。None 表示由后端决定全部可用历史。
+
+        Returns:
+            checkpoint 列表；线程不存在或 limit 小于等于 0 时返回空列表。
+        """
+        if limit is not None and limit <= 0:
+            return []
+        checkpoint = self.get(thread_id)
+        return [checkpoint] if checkpoint is not None else []
+
 
 class FilePersistence(BasePersistence):
     """基于文件系统的持久化存储。
@@ -1750,26 +1780,41 @@ class FilePersistence(BasePersistence):
 
     def put(self, thread_id: str, checkpoint: Checkpoint) -> None:
         file_path = self._base_dir / f"{thread_id}.json"
+        if checkpoint.parent_id is None and file_path.exists():
+            with open(file_path, encoding="utf-8") as existing_file:
+                existing_data = json.load(existing_file)
+            checkpoint.parent_id = existing_data.get("checkpoint_id")
+
         data = {
             "thread_id": checkpoint.thread_id,
             "step": checkpoint.step,
             "state": checkpoint.state,
             "next_node": checkpoint.next_node,
             "reason": checkpoint.reason,
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "parent_id": checkpoint.parent_id,
+            "created_at": checkpoint.created_at,
+            "metadata": checkpoint.metadata,
         }
-        with open(file_path, "w") as f:
-            json.dump(data, f)
+        temporary_path = file_path.with_suffix(".tmp")
+        with open(temporary_path, "w", encoding="utf-8") as output_file:
+            json.dump(data, output_file, ensure_ascii=False)
+        temporary_path.replace(file_path)
 
     def get(self, thread_id: str) -> Checkpoint | None:
         file_path = self._base_dir / f"{thread_id}.json"
         if not file_path.exists():
             return None
-        with open(file_path) as f:
-            data = json.load(f)
+        with open(file_path, encoding="utf-8") as input_file:
+            data = json.load(input_file)
         return Checkpoint(
             thread_id=data["thread_id"],
             step=data["step"],
             state=data["state"],
             next_node=data["next_node"],
             reason=data.get("reason", "checkpoint"),
+            checkpoint_id=data.get("checkpoint_id", uuid.uuid4().hex),
+            parent_id=data.get("parent_id"),
+            created_at=data.get("created_at", time.time()),
+            metadata=dict(data.get("metadata", {})),
         )
