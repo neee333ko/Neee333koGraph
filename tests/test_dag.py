@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from dag import (
     State, Node, Edge, ConditionalEdge,
-    StateGraph, CompiledGraph, CompileError, GraphRecursionError, RunConfig,
+    StateGraph, CompiledGraph, CompileError, GraphRecursionError, RunConfig, Send,
     _merge_state, _parse_reducers,
 )
 
@@ -355,6 +355,55 @@ class TestInvoke(unittest.TestCase):
         with self.assertRaisesRegex(GraphRecursionError, "最大步数 3"):
             app.invoke({"count": 0}, config=RunConfig(recursion_limit=3))
 
+    def test_send_fan_out_reduce(self):
+        """验证 Send 动态分发、顺序归约和统一汇合。"""
+        import operator
+        from typing import Annotated
+
+        class ResearchState(State):
+            topics: list[str]
+            topic: str
+            findings: Annotated[list[str], operator.add]
+            summary: int
+
+        g = StateGraph(ResearchState)
+        g.add_node("dispatch", lambda state: None)
+        g.add_node(
+            "worker",
+            lambda state: {"findings": [state["topic"]]},
+        )
+        g.add_node(
+            "aggregate",
+            lambda state: {"summary": len(state["findings"])},
+        )
+        g.add_conditional_edges(
+            "dispatch",
+            lambda state: [
+                Send("worker", {"topic": topic})
+                for topic in state["topics"]
+            ],
+        )
+        g.add_edge("worker", "aggregate")
+        g.set_entry_point("dispatch")
+        g.set_finish_point("aggregate")
+
+        steps = list(g.compile().stream({
+            "topics": ["data", "speech", "risk"],
+            "topic": "",
+            "findings": [],
+            "summary": 0,
+        }))
+
+        self.assertEqual(
+            [name for name, _ in steps],
+            ["dispatch", "worker", "worker", "worker", "aggregate"],
+        )
+        self.assertEqual(
+            steps[-1][1]["findings"],
+            ["data", "speech", "risk"],
+        )
+        self.assertEqual(steps[-1][1]["summary"], 3)
+
 
 class TestAsyncInvoke(unittest.IsolatedAsyncioTestCase):
     """测试异步执行。"""
@@ -417,6 +466,63 @@ class TestAsyncInvoke(unittest.IsolatedAsyncioTestCase):
                 {"count": 0},
                 config=RunConfig(recursion_limit=3),
             )
+
+    async def test_async_send_fan_out_reduce(self):
+        """验证异步 Send 并发限制、顺序归约和统一汇合。"""
+        import operator
+        from typing import Annotated
+
+        class ResearchState(State):
+            topics: list[str]
+            topic: str
+            findings: Annotated[list[str], operator.add]
+            summary: int
+
+        active = 0
+        peak = 0
+
+        async def worker(state: dict) -> dict:
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return {"findings": [state["topic"]]}
+
+        g = StateGraph(ResearchState)
+        g.add_node("dispatch", lambda state: None)
+        g.add_node("worker", worker)
+        g.add_node(
+            "aggregate",
+            lambda state: {"summary": len(state["findings"])},
+        )
+        g.add_conditional_edges(
+            "dispatch",
+            lambda state: [
+                Send("worker", {"topic": topic})
+                for topic in state["topics"]
+            ],
+        )
+        g.add_edge("worker", "aggregate")
+        g.set_entry_point("dispatch")
+        g.set_finish_point("aggregate")
+
+        result = await g.compile().ainvoke(
+            {
+                "topics": ["data", "speech", "chat", "event", "risk"],
+                "topic": "",
+                "findings": [],
+                "summary": 0,
+            },
+            config=RunConfig(max_concurrency=2),
+        )
+
+        self.assertEqual(
+            result["findings"],
+            ["data", "speech", "chat", "event", "risk"],
+        )
+        self.assertEqual(result["summary"], 5)
+        self.assertEqual(peak, 2)
 
     async def test_astream(self):
         """验证异步流式输出。"""

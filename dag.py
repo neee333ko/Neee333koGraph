@@ -22,6 +22,7 @@ from typing import (
     runtime_checkable,
 )
 import abc
+import asyncio
 import inspect
 import json
 import time
@@ -393,17 +394,20 @@ class Send:
     arg: dict[str, Any]
 
 
+RouteResult = str | Send | list[Send]
+
+
 @dataclass
 class ConditionalEdge:
     """条件边：根据路由函数的结果动态选择下一个节点。
 
     Attributes:
         source: 源节点名称。
-        router: 路由函数，接收状态返回一个字符串键。
+        router: 路由函数，返回字符串键、单个 Send 或 Send 列表。
         path_map: 路由返回值到目标节点名称的映射字典。
     """
     source: str
-    router: Callable[[dict], str]
+    router: Callable[[dict], RouteResult]
     path_map: dict[str, str]
 
 
@@ -530,18 +534,22 @@ class StateGraph:
     def add_conditional_edges(
         self,
         source: str,
-        router: Callable[[dict], str],
-        path_map: dict[str, str],
+        router: Callable[[dict], RouteResult],
+        path_map: dict[str, str] | None = None,
     ) -> None:
         """添加条件边：根据路由函数的结果动态选择下一个节点。
 
         Args:
             source: 源节点名称。
-            router: 路由函数，接收状态返回一个字符串键。
-            path_map: 路由返回值到目标节点名称的映射字典。
+            router: 路由函数，返回字符串键、单个 Send 或 Send 列表。
+            path_map: 字符串路由键到目标节点的映射。Send 路由可省略。
         """
         self._conditional_edges.append(
-            ConditionalEdge(source=source, router=router, path_map=path_map),
+            ConditionalEdge(
+                source=source,
+                router=router,
+                path_map=dict(path_map or {}),
+            ),
         )
 
     def set_entry_point(self, name: str) -> None:
@@ -839,20 +847,49 @@ class CompiledGraph:
                     persistence.put(tid, cp)
                 break
 
-            # 查找下一个节点
-            current = self._get_next_node(current, state)
+            # 查找下一个节点或动态并行分支
+            route_result = self._get_next_node(current, state)
+            if isinstance(route_result, (Send, list)):
+                sends = (
+                    [route_result]
+                    if isinstance(route_result, Send)
+                    else route_result
+                )
+                if step + len(sends) > run_config.recursion_limit:
+                    raise GraphRecursionError(
+                        f"并行分支将超过最大步数 {run_config.recursion_limit}。"
+                    )
+                branch_updates, continuation = self._run_sends(
+                    sends,
+                    state,
+                    max_concurrency=run_config.max_concurrency,
+                )
+                for node_name, branch_update in branch_updates:
+                    step += 1
+                    state = _merge_state(
+                        state,
+                        branch_update,
+                        self._reducers,
+                    )
+                    yield node_name, state
+                current = continuation
+            else:
+                current = route_result
 
         return state
 
-    def _get_next_node(self, current: str, state: dict) -> str | None:
-        """根据当前节点和状态，查找下一个应执行的节点。
+    def _get_next_node(self, current: str, state: dict) -> RouteResult | None:
+        """根据当前节点和状态，解析下一步路由结果。
 
         Args:
             current: 当前节点名称。
             state: 当前状态。
 
         Returns:
-            下一个节点名称，如果没有则返回 None。
+            下一个节点名称、动态 Send 任务或 Send 列表；没有后继则返回 None。
+
+        Raises:
+            TypeError: 路由函数返回了不支持的类型时抛出。
         """
         # 先查普通边
         if current in self._outgoing:
@@ -860,9 +897,173 @@ class CompiledGraph:
         # 再查条件边
         if current in self._conditional_map:
             ce = self._conditional_map[current]
-            route_key = ce.router(state)
-            return ce.path_map.get(route_key)
+            route_result = ce.router(state)
+            if isinstance(route_result, str):
+                return ce.path_map.get(route_result)
+            if isinstance(route_result, Send):
+                return route_result
+            if isinstance(route_result, list):
+                if all(isinstance(item, Send) for item in route_result):
+                    return route_result
+                raise TypeError("条件路由列表只能包含 Send 对象。")
+            raise TypeError(
+                f"条件路由返回了不支持的类型: {type(route_result).__name__}。"
+            )
         return None
+
+    def _run_send(
+        self,
+        send: Send,
+        state: dict,
+    ) -> tuple[str, dict | None, str | None]:
+        """同步执行一个 Send 分支并解析其汇合节点。
+
+        Args:
+            send: 动态分支任务。
+            state: 分发前的共享状态。
+
+        Returns:
+            (目标节点名, 节点局部更新, 后继汇合节点)。
+
+        Raises:
+            ValueError: Send 指向未知节点或分支产生嵌套 Send 时抛出。
+            TypeError: 同步执行遇到 async 节点时抛出。
+        """
+        if send.node not in self._nodes:
+            raise ValueError(f"Send 指向未注册节点: '{send.node}'。")
+
+        branch_state = dict(state)
+        branch_state.update(send.arg)
+        updates = self._nodes[send.node].run(branch_state)
+        if inspect.isawaitable(updates):
+            if inspect.iscoroutine(updates):
+                updates.close()
+            raise TypeError(
+                f"Send 目标节点 '{send.node}' 是异步节点，请使用 ainvoke()。"
+            )
+
+        branch_state = _merge_state(branch_state, updates, self._reducers)
+        continuation = self._get_next_node(send.node, branch_state)
+        if isinstance(continuation, (Send, list)):
+            raise ValueError("Send 分支暂不支持嵌套动态分发。")
+        return send.node, updates, continuation
+
+    def _run_sends(
+        self,
+        sends: list[Send],
+        state: dict,
+        *,
+        max_concurrency: int,
+    ) -> tuple[list[tuple[str, dict | None]], str | None]:
+        """并发执行多个同步 Send 分支。
+
+        Args:
+            sends: 动态分支任务列表。
+            state: 分发前的共享状态。
+            max_concurrency: 最大并发分支数。
+
+        Returns:
+            (按 sends 顺序排列的节点更新列表, 统一汇合节点)。
+
+        Raises:
+            ValueError: max_concurrency 非法或分支未汇合到同一后继节点时抛出。
+        """
+        if max_concurrency < 1:
+            raise ValueError("max_concurrency 必须大于等于 1。")
+        if not sends:
+            return [], None
+
+        worker_count = min(max_concurrency, len(sends))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(self._run_send, send, state)
+                for send in sends
+            ]
+            branch_results = [future.result() for future in futures]
+
+        continuations = {result[2] for result in branch_results}
+        if len(continuations) != 1:
+            raise ValueError("并行 Send 分支必须汇合到同一个后继节点。")
+
+        updates = [(node_name, update) for node_name, update, _ in branch_results]
+        return updates, continuations.pop()
+
+    async def _arun_send(
+        self,
+        send: Send,
+        state: dict,
+    ) -> tuple[str, dict | None, str | None]:
+        """异步执行一个 Send 分支并解析其汇合节点。
+
+        Args:
+            send: 动态分支任务。
+            state: 分发前的共享状态。
+
+        Returns:
+            (目标节点名, 节点局部更新, 后继汇合节点)。
+
+        Raises:
+            ValueError: Send 指向未知节点或分支产生嵌套 Send 时抛出。
+        """
+        if send.node not in self._nodes:
+            raise ValueError(f"Send 指向未注册节点: '{send.node}'。")
+
+        branch_state = dict(state)
+        branch_state.update(send.arg)
+        result = self._nodes[send.node].run(branch_state)
+        if inspect.isawaitable(result):
+            updates = await result
+        else:
+            updates = result
+
+        branch_state = _merge_state(branch_state, updates, self._reducers)
+        continuation = self._get_next_node(send.node, branch_state)
+        if isinstance(continuation, (Send, list)):
+            raise ValueError("Send 分支暂不支持嵌套动态分发。")
+        return send.node, updates, continuation
+
+    async def _arun_sends(
+        self,
+        sends: list[Send],
+        state: dict,
+        *,
+        max_concurrency: int,
+    ) -> tuple[list[tuple[str, dict | None]], str | None]:
+        """并发执行多个异步 Send 分支。
+
+        Args:
+            sends: 动态分支任务列表。
+            state: 分发前的共享状态。
+            max_concurrency: 最大并发分支数。
+
+        Returns:
+            (按 sends 顺序排列的节点更新列表, 统一汇合节点)。
+
+        Raises:
+            ValueError: max_concurrency 非法或分支未汇合到同一后继节点时抛出。
+        """
+        if max_concurrency < 1:
+            raise ValueError("max_concurrency 必须大于等于 1。")
+        if not sends:
+            return [], None
+
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def run_limited(
+            send: Send,
+        ) -> tuple[str, dict | None, str | None]:
+            async with semaphore:
+                return await self._arun_send(send, state)
+
+        branch_results = await asyncio.gather(
+            *(run_limited(send) for send in sends)
+        )
+        continuations = {result[2] for result in branch_results}
+        if len(continuations) != 1:
+            raise ValueError("并行 Send 分支必须汇合到同一个后继节点。")
+
+        updates = [(node_name, update) for node_name, update, _ in branch_results]
+        return updates, continuations.pop()
 
     def resume(
         self,
@@ -895,7 +1096,7 @@ class CompiledGraph:
             raise ValueError(f"线程 '{thread_id}' 的 checkpoint 不存在。")
 
         state = dict(cp.state)
-        current: str | None = cp.next_node
+        current: RouteResult | None = cp.next_node
 
         # 如果 next_node 为 None，说明已经执行完成
         if current is None:
@@ -909,6 +1110,7 @@ class CompiledGraph:
                 current = command.goto
             elif cp.reason == "interrupt":
                 # 中断恢复：跳过已中断的节点，找下一个
+                assert isinstance(current, str)
                 current = self._get_next_node(current, state)
             # 断点/崩溃恢复：重新执行当前节点（current 保持不变）
             if not command.resume:
@@ -921,6 +1123,39 @@ class CompiledGraph:
         executed_steps = 0
 
         while current is not None:
+            if isinstance(current, (Send, list)):
+                sends = [current] if isinstance(current, Send) else current
+                if (
+                    executed_steps + len(sends)
+                    > run_config.recursion_limit
+                ):
+                    raise GraphRecursionError(
+                        f"并行分支将超过最大步数 "
+                        f"{run_config.recursion_limit}。"
+                    )
+                branch_updates, continuation = self._run_sends(
+                    sends,
+                    state,
+                    max_concurrency=run_config.max_concurrency,
+                )
+                for _, branch_update in branch_updates:
+                    executed_steps += 1
+                    step += 1
+                    state = _merge_state(
+                        state,
+                        branch_update,
+                        self._reducers,
+                    )
+                    cp = Checkpoint(
+                        thread_id=thread_id,
+                        step=step,
+                        state=state,
+                        next_node=continuation,
+                    )
+                    persistence.put(thread_id, cp)
+                current = continuation
+                continue
+
             if executed_steps >= run_config.recursion_limit:
                 raise GraphRecursionError(
                     f"图恢复执行超过最大步数 {run_config.recursion_limit}，"
@@ -1112,8 +1347,34 @@ class CompiledGraph:
                     persistence.put(tid, cp)
                 break
 
-            # 查找下一个节点
-            current = self._get_next_node(current, state)
+            # 查找下一个节点或动态并行分支
+            route_result = self._get_next_node(current, state)
+            if isinstance(route_result, (Send, list)):
+                sends = (
+                    [route_result]
+                    if isinstance(route_result, Send)
+                    else route_result
+                )
+                if step + len(sends) > run_config.recursion_limit:
+                    raise GraphRecursionError(
+                        f"并行分支将超过最大步数 {run_config.recursion_limit}。"
+                    )
+                branch_updates, continuation = await self._arun_sends(
+                    sends,
+                    state,
+                    max_concurrency=run_config.max_concurrency,
+                )
+                for node_name, branch_update in branch_updates:
+                    step += 1
+                    state = _merge_state(
+                        state,
+                        branch_update,
+                        self._reducers,
+                    )
+                    yield node_name, state
+                current = continuation
+            else:
+                current = route_result
 
         return
 
@@ -1148,7 +1409,7 @@ class CompiledGraph:
             raise ValueError(f"线程 '{thread_id}' 的 checkpoint 不存在。")
 
         state = dict(cp.state)
-        current: str | None = cp.next_node
+        current: RouteResult | None = cp.next_node
 
         # 如果 next_node 为 None，说明已经执行完成
         if current is None:
@@ -1162,6 +1423,7 @@ class CompiledGraph:
                 current = command.goto
             elif cp.reason == "interrupt":
                 # 中断恢复：跳过已中断的节点，找下一个
+                assert isinstance(current, str)
                 current = self._get_next_node(current, state)
             # 断点/崩溃恢复：重新执行当前节点（current 保持不变）
             if not command.resume:
@@ -1174,6 +1436,39 @@ class CompiledGraph:
         executed_steps = 0
 
         while current is not None:
+            if isinstance(current, (Send, list)):
+                sends = [current] if isinstance(current, Send) else current
+                if (
+                    executed_steps + len(sends)
+                    > run_config.recursion_limit
+                ):
+                    raise GraphRecursionError(
+                        f"并行分支将超过最大步数 "
+                        f"{run_config.recursion_limit}。"
+                    )
+                branch_updates, continuation = await self._arun_sends(
+                    sends,
+                    state,
+                    max_concurrency=run_config.max_concurrency,
+                )
+                for _, branch_update in branch_updates:
+                    executed_steps += 1
+                    step += 1
+                    state = _merge_state(
+                        state,
+                        branch_update,
+                        self._reducers,
+                    )
+                    cp = Checkpoint(
+                        thread_id=thread_id,
+                        step=step,
+                        state=state,
+                        next_node=continuation,
+                    )
+                    persistence.put(thread_id, cp)
+                current = continuation
+                continue
+
             if executed_steps >= run_config.recursion_limit:
                 raise GraphRecursionError(
                     f"图恢复执行超过最大步数 {run_config.recursion_limit}，"
